@@ -17,6 +17,8 @@
 
 package org.apache.dolphinscheduler.api.dto;
 
+import org.apache.dolphinscheduler.common.enums.MisfirePolicy;
+
 import java.util.Date;
 
 import lombok.Data;
@@ -31,6 +33,7 @@ public class ScheduleParam {
     private Date endTime;
     private String crontab;
     private String timezoneId;
+    private MisfirePolicy misfirePolicy = MisfirePolicy.IGNORE_MISFIRES;
 
     public ScheduleParam() {
     }

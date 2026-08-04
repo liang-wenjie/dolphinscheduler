@@ -18,6 +18,7 @@
 package org.apache.dolphinscheduler.api.vo;
 
 import org.apache.dolphinscheduler.common.enums.FailureStrategy;
+import org.apache.dolphinscheduler.common.enums.MisfirePolicy;
 import org.apache.dolphinscheduler.common.enums.Priority;
 import org.apache.dolphinscheduler.common.enums.ReleaseState;
 import org.apache.dolphinscheduler.common.enums.WarningType;
@@ -54,6 +55,8 @@ public class ScheduleVO {
 
     private String crontab;
 
+    private MisfirePolicy misfirePolicy;
+
     private FailureStrategy failureStrategy;
 
     private WarningType warningType;
@@ -83,6 +86,7 @@ public class ScheduleVO {
     public ScheduleVO(Schedule schedule) {
         this.setId(schedule.getId());
         this.setCrontab(schedule.getCrontab());
+        this.setMisfirePolicy(schedule.getMisfirePolicy());
         this.setProjectName(schedule.getProjectName());
         this.setUserName(schedule.getUserName());
         this.setWorkerGroup(schedule.getWorkerGroup());

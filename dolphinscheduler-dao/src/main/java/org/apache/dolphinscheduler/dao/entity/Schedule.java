@@ -18,6 +18,7 @@
 package org.apache.dolphinscheduler.dao.entity;
 
 import org.apache.dolphinscheduler.common.enums.FailureStrategy;
+import org.apache.dolphinscheduler.common.enums.MisfirePolicy;
 import org.apache.dolphinscheduler.common.enums.Priority;
 import org.apache.dolphinscheduler.common.enums.ReleaseState;
 import org.apache.dolphinscheduler.common.enums.WarningType;
@@ -66,6 +67,8 @@ public class Schedule {
     private String timezoneId;
 
     private String crontab;
+
+    private MisfirePolicy misfirePolicy;
 
     private FailureStrategy failureStrategy;
 

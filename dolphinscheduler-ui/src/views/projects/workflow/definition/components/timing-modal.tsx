@@ -295,6 +295,8 @@ export default defineComponent({
         ]
         timingState.timingForm.crontab = props.row.crontab
         timingState.timingForm.timezoneId = props.row.timezoneId
+        timingState.timingForm.misfirePolicy =
+          props.row.misfirePolicy || 'IGNORE_MISFIRES'
         timingState.timingForm.failureStrategy = props.row.failureStrategy
         timingState.timingForm.warningType = props.row.warningType
         timingState.timingForm.workflowInstancePriority =
@@ -409,6 +411,28 @@ export default defineComponent({
                 </NListItem>
               ) : null}
             </NList>
+          </NFormItem>
+          <NFormItem
+            label={t('project.workflow.misfire_policy')}
+            path='misfirePolicy'
+          >
+            <NSelect
+              options={[
+                {
+                  value: 'DO_NOTHING',
+                  label: t('project.workflow.do_nothing')
+                },
+                {
+                  value: 'FIRE_AND_PROCEED',
+                  label: t('project.workflow.fire_and_proceed')
+                },
+                {
+                  value: 'IGNORE_MISFIRES',
+                  label: t('project.workflow.ignore_misfires')
+                }
+              ]}
+              v-model:value={this.timingForm.misfirePolicy}
+            />
           </NFormItem>
           <NFormItem
             label={t('project.workflow.failure_strategy')}

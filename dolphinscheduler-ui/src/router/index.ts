@@ -55,13 +55,21 @@ router.beforeEach(
     NProgress.start()
     const userStore = useUserStore()
     const metaData: metaData = to.meta
+
+    // 内嵌模式：一次带 ?embed=1 进入后，后续跳转自动延续该参数
+    const embedMode = to.query.embed === '1' || from.query.embed === '1'
+    if (embedMode && to.query.embed !== '1') {
+      next({ ...to, query: { ...to.query, embed: '1' } })
+      return
+    }
+
     if (
       metaData.auth?.includes('ADMIN_USER') &&
       (userStore.getUserInfo as UserInfoRes).userType !== 'ADMIN_USER' &&
       metaData.activeMenu === 'security'
     ) {
       to.fullPath = '/security/token-manage'
-      next({ name: 'token-manage' })
+      next({ name: 'token-manage', query: embedMode ? { embed: '1' } : {} })
     } else {
       next()
     }

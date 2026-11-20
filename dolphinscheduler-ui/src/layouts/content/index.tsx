@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-import { defineComponent, onMounted, watch, toRefs, ref } from 'vue'
+import { defineComponent, onMounted, watch, toRefs, ref, computed } from 'vue'
 import { NLayout, NLayoutContent, NLayoutHeader, useMessage } from 'naive-ui'
 import NavBar from './components/navbar'
 import SideBar from './components/sidebar'
@@ -93,26 +93,37 @@ const Content = defineComponent({
       { immediate: true }
     )
 
+    // 内嵌模式：URL 带 ?embed=1 时隐藏顶部菜单栏，内容区全屏
+    // 基于 route.query 响应式读取，页面内跳转只要保留该参数即可持续生效
+    const embedMode = computed(() => route.query.embed === '1')
+
     return {
       ...toRefs(state),
       changeMenuOption,
       sideKeyRef,
-      currentRoute: route
+      currentRoute: route,
+      embedMode
     }
   },
   render() {
     return (
       <NLayout style='height: 100%'>
-        <NLayoutHeader style='height: 65px'>
-          <NavBar
-            class='tab-horizontal'
-            headerMenuOptions={this.headerMenuOptions}
-            localesOptions={this.localesOptions}
-            timezoneOptions={this.timezoneOptions}
-            userDropdownOptions={this.userDropdownOptions}
-          />
-        </NLayoutHeader>
-        <NLayout has-sider position='absolute' style='top: 65px'>
+        {!this.embedMode && (
+          <NLayoutHeader style='height: 65px'>
+            <NavBar
+              class='tab-horizontal'
+              headerMenuOptions={this.headerMenuOptions}
+              localesOptions={this.localesOptions}
+              timezoneOptions={this.timezoneOptions}
+              userDropdownOptions={this.userDropdownOptions}
+            />
+          </NLayoutHeader>
+        )}
+        <NLayout
+          has-sider
+          position='absolute'
+          style={this.embedMode ? 'top: 0' : 'top: 65px'}
+        >
           {this.isShowSide && (
             <SideBar
               sideMenuOptions={this.sideMenuOptions}

@@ -17,8 +17,11 @@
 
 package org.apache.dolphinscheduler.plugin.task.sql;
 
+import org.apache.dolphinscheduler.common.constants.Constants;
+import org.apache.dolphinscheduler.common.enums.AlertType;
 import org.apache.dolphinscheduler.common.utils.DateUtils;
 import org.apache.dolphinscheduler.common.utils.JSONUtils;
+import org.apache.dolphinscheduler.common.utils.PropertyUtils;
 import org.apache.dolphinscheduler.plugin.datasource.api.plugin.DataSourceClientProvider;
 import org.apache.dolphinscheduler.plugin.datasource.api.plugin.DataSourcePluginManager;
 import org.apache.dolphinscheduler.plugin.datasource.api.utils.DataSourceUtils;
@@ -56,6 +59,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -66,6 +70,7 @@ import java.util.stream.Collectors;
 
 import lombok.extern.slf4j.Slf4j;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
@@ -89,6 +94,34 @@ public class SqlTask extends AbstractTask {
      * default query sql limit
      */
     private static final int QUERY_LIMIT = 10000;
+
+    /**
+     * default max rows kept in the task-result alert content; rows beyond this are replaced by an omission marker,
+     * overridable via the sql.task.alert.max.rows property in common.properties
+     */
+    private static final int DEFAULT_ALERT_MAX_ROWS = 30;
+
+    /**
+     * default max length of a single string field value kept in the alert content; longer values are truncated
+     * with an ellipsis, overridable via the sql.task.alert.max.row.value.length property in common.properties
+     */
+    private static final int DEFAULT_ALERT_MAX_ROW_VALUE_LENGTH = 100;
+
+    /**
+     * default max serialized UTF-8 bytes of the alert content, kept below the 65535-byte capacity
+     * of the MySQL TEXT column that stores t_ds_alert.content, overridable via the
+     * sql.task.alert.max.content.bytes property in common.properties
+     */
+    private static final int DEFAULT_ALERT_MAX_CONTENT_BYTES = 60000;
+
+    private final int alertMaxRows =
+            PropertyUtils.getInt(Constants.SQL_TASK_ALERT_MAX_ROWS, DEFAULT_ALERT_MAX_ROWS);
+
+    private final int alertMaxRowValueLength =
+            PropertyUtils.getInt(Constants.SQL_TASK_ALERT_MAX_ROW_VALUE_LENGTH, DEFAULT_ALERT_MAX_ROW_VALUE_LENGTH);
+
+    private final int alertMaxContentBytes =
+            PropertyUtils.getInt(Constants.SQL_TASK_ALERT_MAX_CONTENT_BYTES, DEFAULT_ALERT_MAX_CONTENT_BYTES);
 
     private final SQLTaskExecutionContext sqlTaskExecutionContext;
 
@@ -269,31 +302,35 @@ public class SqlTask extends AbstractTask {
                 }
             }
 
+            int displayRows = sqlParameters.getDisplayRows() > 0 ? sqlParameters.getDisplayRows()
+                    : TaskConstants.DEFAULT_DISPLAY_ROWS;
+            log.info("display the first {} rows of sql result as follows:", displayRows);
             while (resultSet.next()) {
                 ObjectNode mapOfColValues = JSONUtils.createObjectNode();
                 for (int i = 1; i <= num; i++) {
                     mapOfColValues.set(columnLabels[i - 1], JSONUtils.toJsonNode(resultSet.getObject(i)));
                 }
                 resultJSONArray.add(mapOfColValues);
+                if (resultJSONArray.size() <= displayRows) {
+                    log.info("row {} : {}", resultJSONArray.size(), JSONUtils.toJsonString(mapOfColValues));
+                }
             }
-
-            int displayRows = sqlParameters.getDisplayRows() > 0 ? sqlParameters.getDisplayRows()
-                    : TaskConstants.DEFAULT_DISPLAY_ROWS;
-            displayRows = Math.min(displayRows, resultJSONArray.size());
-            log.info("display sql result {} rows as follows:", displayRows);
-            for (int i = 0; i < displayRows; i++) {
-                String row = JSONUtils.toJsonString(resultJSONArray.get(i));
-                log.info("row {} : {}", i + 1, row);
-            }
+            log.info("displayed {} of {} rows", Math.min(displayRows, resultJSONArray.size()),
+                    resultJSONArray.size());
         }
 
-        String result = resultJSONArray.isEmpty() ? JSONUtils.toJsonString(generateEmptyRow(resultSet))
-                : JSONUtils.toJsonString(resultJSONArray);
+        String result;
+        ArrayNode alertArray = resultJSONArray;
+        if (resultJSONArray.isEmpty()) {
+            ArrayNode emptyRow = generateEmptyRow(resultSet);
+            result = JSONUtils.toJsonString(emptyRow);
+            alertArray = emptyRow;
+        } else {
+            result = JSONUtils.toJsonString(resultJSONArray);
+        }
 
         if (Boolean.TRUE.equals(sqlParameters.getSendEmail())) {
-            sendAttachment(sqlParameters.getGroupId(), StringUtils.isNotEmpty(sqlParameters.getTitle())
-                    ? sqlParameters.getTitle()
-                    : taskExecutionContext.getTaskName() + " query result sets", result);
+            prepareTaskResultAlert(alertArray);
         }
         log.debug("execute sql result : {}", result);
         return result;
@@ -320,18 +357,127 @@ public class SqlTask extends AbstractTask {
     }
 
     /**
-     * send alert as an attachment
-     *
-     * @param title   title
-     * @param content content
+     * Prepare task result alert info with the complete query result as content.
      */
-    private void sendAttachment(int groupId, String title, String content) {
-        setNeedAlert(Boolean.TRUE);
+    private void prepareTaskResultAlert(ArrayNode resultJSONArray) {
         TaskAlertInfo taskAlertInfo = new TaskAlertInfo();
-        taskAlertInfo.setAlertGroupId(groupId);
-        taskAlertInfo.setContent(content);
-        taskAlertInfo.setTitle(title);
-        setTaskAlertInfo(taskAlertInfo);
+        taskAlertInfo.setAlertGroupId(sqlParameters.getGroupId());
+        taskAlertInfo.setTitle(StringUtils.isNotEmpty(sqlParameters.getTitle())
+                ? sqlParameters.getTitle()
+                : taskExecutionContext.getTaskName() + " query result sets");
+        taskAlertInfo.setContent(limitAlertContent(resultJSONArray));
+        taskAlertInfo.setAlertType(AlertType.TASK_RESULT);
+
+        taskExecutionContext.setNeedAlert(true);
+        taskExecutionContext.setTaskAlertInfo(taskAlertInfo);
+        log.debug("Prepare task result alert: title={}, alertGroupId={}, alertType={}, totalRows={}",
+                taskAlertInfo.getTitle(), taskAlertInfo.getAlertGroupId(), taskAlertInfo.getAlertType(),
+                resultJSONArray.size());
+    }
+
+    /**
+     * Build a size-limited alert content that stays a valid JSON array.
+     * At most the configured max rows are kept; string field values longer than the configured
+     * max value length are truncated with an ellipsis. The serialized content is bounded by
+     * the configured max UTF-8 bytes: rows are dropped from the tail until it fits; a row that
+     * alone exceeds the budget is replaced by the omission marker.
+     */
+    private String limitAlertContent(ArrayNode resultJSONArray) {
+        int totalRows = resultJSONArray.size();
+
+        // Serialize each kept row once and track the running UTF-8 byte size, so the budget
+        // check on every dropped row is O(1) instead of rebuilding and re-encoding the whole
+        // content (which would turn the drop loop into O(rows^2)).
+        List<String> serializedRows = new ArrayList<>(Math.min(totalRows, alertMaxRows));
+        int rowsBytes = 0;
+        for (int i = 0; i < totalRows && i < alertMaxRows; i++) {
+            String rowJson = JSONUtils.toJsonString(limitRowValues(resultJSONArray.get(i)));
+            serializedRows.add(rowJson);
+            rowsBytes += rowJson.getBytes(StandardCharsets.UTF_8).length;
+        }
+
+        int omittedRows = totalRows - serializedRows.size();
+        while (!serializedRows.isEmpty()
+                && contentBytes(rowsBytes, serializedRows.size(), omittedRows) > alertMaxContentBytes) {
+            int last = serializedRows.size() - 1;
+            rowsBytes -= serializedRows.remove(last).getBytes(StandardCharsets.UTF_8).length;
+            omittedRows++;
+        }
+        return buildAlertContent(serializedRows, omittedRows);
+    }
+
+    /**
+     * UTF-8 byte size of the alert content that buildAlertContent produces from the kept rows
+     * and the omission marker, i.e. "[" + rows joined by "," + ("," + marker)? + "]".
+     */
+    private int contentBytes(int rowsBytes, int rowCount, int omittedRows) {
+        int bytes = 2; // '[' and ']'
+        if (rowCount > 0) {
+            bytes += rowsBytes + rowCount - 1; // the rows plus their ',' separators
+        }
+        if (omittedRows > 0) {
+            bytes += (rowCount > 0 ? 1 : 0)
+                    + JSONUtils.toJsonString(createOmissionMarker(omittedRows)).getBytes(StandardCharsets.UTF_8).length;
+        }
+        return bytes;
+    }
+
+    /**
+     * Assemble the alert content from the kept rows and the omission marker,
+     * i.e. "[" + rows joined by "," + ("," + marker)? + "]".
+     */
+    private String buildAlertContent(List<String> serializedRows, int omittedRows) {
+        StringBuilder content = new StringBuilder();
+        content.append('[');
+        for (int i = 0; i < serializedRows.size(); i++) {
+            if (i > 0) {
+                content.append(',');
+            }
+            content.append(serializedRows.get(i));
+        }
+        if (omittedRows > 0) {
+            if (!serializedRows.isEmpty()) {
+                content.append(',');
+            }
+            content.append(JSONUtils.toJsonString(createOmissionMarker(omittedRows)));
+        }
+        content.append(']');
+        return content.toString();
+    }
+
+    private ObjectNode createOmissionMarker(int omittedRows) {
+        ObjectNode omitted = JSONUtils.createObjectNode();
+        omitted.put("...", omittedRows + " more rows omitted");
+        return omitted;
+    }
+
+    private JsonNode limitRowValues(JsonNode row) {
+        if (!row.isObject()) {
+            return row;
+        }
+        ObjectNode limitedRow = JSONUtils.createObjectNode();
+        Iterator<Map.Entry<String, JsonNode>> fields = row.fields();
+        while (fields.hasNext()) {
+            Map.Entry<String, JsonNode> entry = fields.next();
+            JsonNode value = entry.getValue();
+            if (value.isTextual() && value.textValue().length() > alertMaxRowValueLength) {
+                limitedRow.put(entry.getKey(),
+                        truncateAtCodePointBoundary(value.textValue(), alertMaxRowValueLength) + "...");
+            } else {
+                limitedRow.set(entry.getKey(), value);
+            }
+        }
+        return limitedRow;
+    }
+
+    /**
+     * Cut a string to at most maxChars characters without splitting a surrogate pair.
+     */
+    private String truncateAtCodePointBoundary(String text, int maxChars) {
+        if (text.codePointCount(0, text.length()) <= maxChars) {
+            return text;
+        }
+        return text.substring(0, text.offsetByCodePoints(0, maxChars));
     }
 
     private String executeQuery(Connection connection, SqlBinds sqlBinds, String handlerType) throws Exception {

@@ -127,7 +127,7 @@ export default defineComponent({
       if (props.definition) {
         return (
           route.name === 'workflow-definition-detail' &&
-          props.definition!.workflowDefinition.releaseState === 'ONLINE'
+          props.definition.workflowDefinition?.releaseState === 'ONLINE'
         )
       } else {
         return false
@@ -149,11 +149,17 @@ export default defineComponent({
           props.instance.state === 'STOP'
         )
       } else if (props.definition) {
-        return props.definition!.workflowDefinition.releaseState === 'OFFLINE'
+        return props.definition.workflowDefinition?.releaseState === 'OFFLINE'
       } else {
         return false
       }
     })
+
+    const copyDisplay = computed(
+      () =>
+        menuDisplay.value ||
+        (route.name === 'workflow-definition-create' && !props.readonly)
+    )
 
     const taskInstance = computed(() => {
       if (nodeVariables.menuCell) {
@@ -401,6 +407,7 @@ export default defineComponent({
           startDisplay={startDisplay.value}
           executeTaskDisplay={executeTaskDisplay.value}
           menuDisplay={menuDisplay.value}
+          copyDisplay={copyDisplay.value}
           taskInstance={taskInstance.value}
           cell={nodeVariables.menuCell as Cell}
           visible={nodeVariables.menuVisible}

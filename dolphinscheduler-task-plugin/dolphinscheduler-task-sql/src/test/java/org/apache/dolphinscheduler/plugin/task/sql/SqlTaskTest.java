@@ -20,8 +20,10 @@ package org.apache.dolphinscheduler.plugin.task.sql;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+import org.apache.dolphinscheduler.common.enums.AlertType;
 import org.apache.dolphinscheduler.common.utils.DateUtils;
 import org.apache.dolphinscheduler.common.utils.JSONUtils;
+import org.apache.dolphinscheduler.common.utils.PropertyUtils;
 import org.apache.dolphinscheduler.plugin.task.api.TaskConstants;
 import org.apache.dolphinscheduler.plugin.task.api.TaskException;
 import org.apache.dolphinscheduler.plugin.task.api.TaskExecutionContext;
@@ -29,6 +31,7 @@ import org.apache.dolphinscheduler.plugin.task.api.enums.DataType;
 import org.apache.dolphinscheduler.plugin.task.api.enums.Direct;
 import org.apache.dolphinscheduler.plugin.task.api.enums.ResourceType;
 import org.apache.dolphinscheduler.plugin.task.api.model.Property;
+import org.apache.dolphinscheduler.plugin.task.api.model.TaskAlertInfo;
 import org.apache.dolphinscheduler.plugin.task.api.parameters.SqlParameters;
 import org.apache.dolphinscheduler.plugin.task.api.parameters.resource.DataSourceParameters;
 import org.apache.dolphinscheduler.plugin.task.api.parameters.resource.ResourceParametersHelper;
@@ -36,6 +39,7 @@ import org.apache.dolphinscheduler.plugin.task.api.resource.ResourceContext;
 import org.apache.dolphinscheduler.plugin.task.api.utils.ParameterUtils;
 import org.apache.dolphinscheduler.spi.enums.DbType;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
@@ -44,13 +48,24 @@ import java.nio.file.Path;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
+import org.slf4j.LoggerFactory;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.collect.Lists;
@@ -378,6 +393,145 @@ class SqlTaskTest {
     }
 
     @Test
+    void testResultProcessLogsRowsWhileFetchingAndOnlyUpToDisplayRows() throws Exception {
+        String taskParams = "{\"type\":\"HIVE\",\"datasource\":1,\"sql\":\"select 1\",\"displayRows\":2}";
+        TaskExecutionContext ctx = new TaskExecutionContext();
+        ctx.setTaskParams(taskParams);
+        ctx.setTaskName("display_rows_task");
+        ctx.setResourceParametersHelper(getResourceParametersHelperWithDatasourceType(DbType.HIVE));
+
+        SqlTask task = new SqlTask(ctx);
+
+        ListAppender<ILoggingEvent> appender = attachLogAppender();
+        try {
+            ResultSet mockResultSet = mock(ResultSet.class);
+            ResultSetMetaData mockMetaData = mock(ResultSetMetaData.class);
+            when(mockResultSet.getMetaData()).thenReturn(mockMetaData);
+            when(mockMetaData.getColumnCount()).thenReturn(1);
+            when(mockMetaData.getColumnLabel(1)).thenReturn("id");
+            AtomicInteger fetchedRows = new AtomicInteger();
+            when(mockResultSet.next()).thenAnswer(inv -> fetchedRows.incrementAndGet() <= 5);
+            when(mockResultSet.getObject(1)).thenAnswer(inv -> {
+                int currentRow = fetchedRows.get();
+                if (currentRow > 1) {
+                    long loggedRows = appender.list.stream()
+                            .map(ILoggingEvent::getFormattedMessage)
+                            .filter(message -> message.startsWith("row "))
+                            .count();
+                    Assertions.assertEquals(Math.min(currentRow - 1, 2), loggedRows, "before fetching row "
+                            + currentRow + ", the first " + Math.min(currentRow - 1, 2)
+                            + " rows should already be logged");
+                }
+                return "v" + currentRow;
+            });
+
+            Method resultProcessMethod = SqlTask.class.getDeclaredMethod("resultProcess", ResultSet.class);
+            resultProcessMethod.setAccessible(true);
+            String result = (String) resultProcessMethod.invoke(task, mockResultSet);
+
+            List<String> messages = appender.list.stream()
+                    .map(ILoggingEvent::getFormattedMessage)
+                    .collect(Collectors.toList());
+            Assertions.assertTrue(messages.contains("display the first 2 rows of sql result as follows:"));
+            Assertions.assertTrue(messages.contains("row 1 : {\"id\":\"v1\"}"));
+            Assertions.assertTrue(messages.contains("row 2 : {\"id\":\"v2\"}"));
+            Assertions.assertEquals(2, messages.stream().filter(message -> message.startsWith("row ")).count(),
+                    "only the first displayRows=2 rows should be logged");
+            Assertions.assertTrue(messages.contains("displayed 2 of 5 rows"));
+            // the full result set is kept regardless of the display limit
+            Assertions.assertTrue(result.contains("v3"));
+            Assertions.assertTrue(result.contains("v5"));
+        } finally {
+            detachLogAppender(appender);
+        }
+    }
+
+    @Test
+    void testResultProcessLogsAllRowsWhenResultSmallerThanDefaultDisplayRows() throws Exception {
+        String taskParams = "{\"type\":\"HIVE\",\"datasource\":1,\"sql\":\"select 1\"}";
+        TaskExecutionContext ctx = new TaskExecutionContext();
+        ctx.setTaskParams(taskParams);
+        ctx.setTaskName("default_display_rows_task");
+        ctx.setResourceParametersHelper(getResourceParametersHelperWithDatasourceType(DbType.HIVE));
+
+        SqlTask task = new SqlTask(ctx);
+
+        ListAppender<ILoggingEvent> appender = attachLogAppender();
+        try {
+            ResultSet mockResultSet = mock(ResultSet.class);
+            ResultSetMetaData mockMetaData = mock(ResultSetMetaData.class);
+            when(mockResultSet.getMetaData()).thenReturn(mockMetaData);
+            when(mockMetaData.getColumnCount()).thenReturn(1);
+            when(mockMetaData.getColumnLabel(1)).thenReturn("id");
+            when(mockResultSet.next()).thenReturn(true, true, false);
+            when(mockResultSet.getObject(1)).thenReturn("v");
+
+            Method resultProcessMethod = SqlTask.class.getDeclaredMethod("resultProcess", ResultSet.class);
+            resultProcessMethod.setAccessible(true);
+            resultProcessMethod.invoke(task, mockResultSet);
+
+            List<String> messages = appender.list.stream()
+                    .map(ILoggingEvent::getFormattedMessage)
+                    .collect(Collectors.toList());
+            Assertions.assertTrue(messages.contains("display the first 10 rows of sql result as follows:"));
+            Assertions.assertTrue(messages.contains("row 1 : {\"id\":\"v\"}"));
+            Assertions.assertTrue(messages.contains("row 2 : {\"id\":\"v\"}"));
+            Assertions.assertEquals(2, messages.stream().filter(message -> message.startsWith("row ")).count());
+            Assertions.assertTrue(messages.contains("displayed 2 of 2 rows"));
+        } finally {
+            detachLogAppender(appender);
+        }
+    }
+
+    @Test
+    void testResultProcessLogsNoRowForEmptyResultSet() throws Exception {
+        String taskParams = "{\"type\":\"HIVE\",\"datasource\":1,\"sql\":\"select 1\",\"displayRows\":3}";
+        TaskExecutionContext ctx = new TaskExecutionContext();
+        ctx.setTaskParams(taskParams);
+        ctx.setTaskName("empty_result_display_rows_task");
+        ctx.setResourceParametersHelper(getResourceParametersHelperWithDatasourceType(DbType.HIVE));
+
+        SqlTask task = new SqlTask(ctx);
+
+        ListAppender<ILoggingEvent> appender = attachLogAppender();
+        try {
+            ResultSet mockResultSet = mock(ResultSet.class);
+            ResultSetMetaData mockMetaData = mock(ResultSetMetaData.class);
+            when(mockResultSet.getMetaData()).thenReturn(mockMetaData);
+            when(mockMetaData.getColumnCount()).thenReturn(1);
+            when(mockMetaData.getColumnLabel(1)).thenReturn("id");
+            when(mockResultSet.next()).thenReturn(false);
+
+            Method resultProcessMethod = SqlTask.class.getDeclaredMethod("resultProcess", ResultSet.class);
+            resultProcessMethod.setAccessible(true);
+            resultProcessMethod.invoke(task, mockResultSet);
+
+            List<String> messages = appender.list.stream()
+                    .map(ILoggingEvent::getFormattedMessage)
+                    .collect(Collectors.toList());
+            Assertions.assertTrue(messages.contains("display the first 3 rows of sql result as follows:"));
+            Assertions.assertEquals(0, messages.stream().filter(message -> message.startsWith("row ")).count());
+            Assertions.assertTrue(messages.contains("displayed 0 of 0 rows"));
+        } finally {
+            detachLogAppender(appender);
+        }
+    }
+
+    private ListAppender<ILoggingEvent> attachLogAppender() {
+        Logger logger = (Logger) LoggerFactory.getLogger(SqlTask.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        return appender;
+    }
+
+    private void detachLogAppender(ListAppender<ILoggingEvent> appender) {
+        Logger logger = (Logger) LoggerFactory.getLogger(SqlTask.class);
+        logger.detachAppender(appender);
+        appender.stop();
+    }
+
+    @Test
     void testGetSqlAndSqlParamsMap_nullPrepareParamsMap_replacesScheduleTimeAndTitlePlaceholder() throws Exception {
         long scheduleTimeMillis = 1700000000000L;
         String expectedDate = DateUtils.format(new java.util.Date(scheduleTimeMillis), "yyyyMMdd");
@@ -487,6 +641,439 @@ class SqlTaskTest {
         ResourceParametersHelper resourceParametersHelper = new ResourceParametersHelper();
         resourceParametersHelper.put(ResourceType.DATASOURCE, 1, parameters);
         return resourceParametersHelper;
+    }
+
+    private TaskExecutionContext createSqlTaskWithAlert(ArrayNode resultArray, int displayRows, String title,
+                                                        int groupId) {
+        SqlParameters sqlParameters = new SqlParameters();
+        sqlParameters.setType("HIVE");
+        sqlParameters.setDatasource(1);
+        sqlParameters.setSql("select 1");
+        sqlParameters.setSendEmail(true);
+        sqlParameters.setDisplayRows(displayRows);
+        sqlParameters.setGroupId(groupId);
+        if (title != null) {
+            sqlParameters.setTitle(title);
+        }
+
+        TaskExecutionContext ctx = new TaskExecutionContext();
+        ctx.setTaskParams(JSONUtils.toJsonString(sqlParameters));
+        ctx.setTaskName("test_sql_task");
+        ctx.setResourceParametersHelper(getResourceParametersHelperWithDatasourceType(DbType.HIVE));
+
+        SqlTask task = new SqlTask(ctx);
+        try {
+            Method method = SqlTask.class.getDeclaredMethod("prepareTaskResultAlert", ArrayNode.class);
+            method.setAccessible(true);
+            method.invoke(task, resultArray);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+        return ctx;
+    }
+
+    @Test
+    void testPrepareTaskResultAlertSetsNeedAlertAndTaskAlertInfo() {
+        ArrayNode resultArray = JSONUtils.createArrayNode();
+        resultArray.add(JSONUtils.parseObject("{\"id\":\"1\",\"name\":\"alice\"}"));
+        resultArray.add(JSONUtils.parseObject("{\"id\":\"2\",\"name\":\"bob\"}"));
+
+        TaskExecutionContext ctx = createSqlTaskWithAlert(resultArray, 10, "My Alert Title", 5);
+
+        Assertions.assertTrue(ctx.isNeedAlert());
+
+        TaskAlertInfo alertInfo = ctx.getTaskAlertInfo();
+        Assertions.assertNotNull(alertInfo);
+        Assertions.assertEquals(5, alertInfo.getAlertGroupId());
+        Assertions.assertEquals("My Alert Title", alertInfo.getTitle());
+        Assertions.assertEquals(AlertType.TASK_RESULT, alertInfo.getAlertType());
+        Assertions.assertNotNull(alertInfo.getContent());
+
+        ArrayNode contentArray = JSONUtils.parseArray(alertInfo.getContent());
+        Assertions.assertEquals(2, contentArray.size());
+    }
+
+    @Test
+    void testPrepareTaskResultAlertKeepsFullContentRegardlessOfDisplayRows() throws Exception {
+        int totalRows = readStaticIntConstant("DEFAULT_ALERT_MAX_ROWS") - 1;
+        ArrayNode resultArray = JSONUtils.createArrayNode();
+        for (int i = 0; i < totalRows; i++) {
+            resultArray.add(JSONUtils.parseObject("{\"id\":\"" + i + "\"}"));
+        }
+
+        // displayRows is only a log-display setting, the alert content must keep all rows
+        TaskExecutionContext ctx = createSqlTaskWithAlert(resultArray, 3, null, 1);
+
+        TaskAlertInfo alertInfo = ctx.getTaskAlertInfo();
+        Assertions.assertNotNull(alertInfo);
+
+        ArrayNode contentArray = JSONUtils.parseArray(alertInfo.getContent());
+        Assertions.assertEquals(totalRows, contentArray.size());
+        Assertions.assertEquals("0", contentArray.get(0).get("id").asText());
+        Assertions.assertEquals(String.valueOf(totalRows - 1), contentArray.get(totalRows - 1).get("id").asText());
+    }
+
+    @Test
+    void testPrepareTaskResultAlertKeepsFullContentWhenDisplayRowsUnset() throws Exception {
+        int totalRows = readStaticIntConstant("DEFAULT_ALERT_MAX_ROWS") - 1;
+        ArrayNode resultArray = JSONUtils.createArrayNode();
+        for (int i = 0; i < totalRows; i++) {
+            resultArray.add(JSONUtils.parseObject("{\"id\":\"" + i + "\"}"));
+        }
+
+        // displayRows = 0 means unset, the alert content still keeps all rows
+        TaskExecutionContext ctx = createSqlTaskWithAlert(resultArray, 0, "default rows test", 2);
+
+        TaskAlertInfo alertInfo = ctx.getTaskAlertInfo();
+        Assertions.assertNotNull(alertInfo);
+
+        ArrayNode contentArray = JSONUtils.parseArray(alertInfo.getContent());
+        Assertions.assertEquals(totalRows, contentArray.size());
+    }
+
+    @Test
+    void testPrepareTaskResultAlertUsesCustomTitle() {
+        ArrayNode resultArray = JSONUtils.createArrayNode();
+        resultArray.add(JSONUtils.parseObject("{\"id\":\"1\"}"));
+
+        TaskExecutionContext ctx = createSqlTaskWithAlert(resultArray, 10, "Custom Title", 1);
+
+        TaskAlertInfo alertInfo = ctx.getTaskAlertInfo();
+        Assertions.assertNotNull(alertInfo);
+        Assertions.assertEquals("Custom Title", alertInfo.getTitle());
+    }
+
+    @Test
+    void testPrepareTaskResultAlertUsesDefaultTitleWhenEmpty() {
+        ArrayNode resultArray = JSONUtils.createArrayNode();
+        resultArray.add(JSONUtils.parseObject("{\"id\":\"1\"}"));
+
+        TaskExecutionContext ctx = createSqlTaskWithAlert(resultArray, 10, null, 1);
+
+        TaskAlertInfo alertInfo = ctx.getTaskAlertInfo();
+        Assertions.assertNotNull(alertInfo);
+        Assertions.assertEquals("test_sql_task query result sets", alertInfo.getTitle());
+    }
+
+    @Test
+    void testPrepareTaskResultAlertTruncatesRowsBeyondMax() throws Exception {
+        int maxRows = readStaticIntConstant("DEFAULT_ALERT_MAX_ROWS");
+        int totalRows = maxRows + 10;
+        ArrayNode resultArray = JSONUtils.createArrayNode();
+        for (int i = 0; i < totalRows; i++) {
+            resultArray.add(JSONUtils.parseObject("{\"id\":\"" + i + "\"}"));
+        }
+
+        TaskExecutionContext ctx = createSqlTaskWithAlert(resultArray, 10, "truncate rows test", 1);
+
+        TaskAlertInfo alertInfo = ctx.getTaskAlertInfo();
+        ArrayNode contentArray = JSONUtils.parseArray(alertInfo.getContent());
+        Assertions.assertEquals(maxRows + 1, contentArray.size());
+        Assertions.assertEquals("0", contentArray.get(0).get("id").asText());
+        JsonNode last = contentArray.get(contentArray.size() - 1);
+        Assertions.assertTrue(last.has("..."));
+        Assertions.assertEquals((totalRows - maxRows) + " more rows omitted", last.get("...").asText());
+    }
+
+    @Test
+    void testPrepareTaskResultAlertTruncatesLongFieldValue() throws Exception {
+        int maxLen = readStaticIntConstant("DEFAULT_ALERT_MAX_ROW_VALUE_LENGTH");
+        StringBuilder longValue = new StringBuilder();
+        for (int i = 0; i < maxLen + 50; i++) {
+            longValue.append("x");
+        }
+        ArrayNode resultArray = JSONUtils.createArrayNode();
+        resultArray.add(JSONUtils.parseObject("{\"id\":\"1\",\"payload\":\"" + longValue + "\"}"));
+
+        TaskExecutionContext ctx = createSqlTaskWithAlert(resultArray, 10, "truncate field test", 1);
+
+        TaskAlertInfo alertInfo = ctx.getTaskAlertInfo();
+        ArrayNode contentArray = JSONUtils.parseArray(alertInfo.getContent());
+        Assertions.assertEquals(1, contentArray.size());
+        String payload = contentArray.get(0).get("payload").asText();
+        Assertions.assertEquals(maxLen + 3, payload.length());
+        Assertions.assertTrue(payload.endsWith("..."));
+    }
+
+    @Test
+    void testPrepareTaskResultAlertBoundsTotalBytesWithWideRows() throws Exception {
+        int maxRows = readStaticIntConstant("DEFAULT_ALERT_MAX_ROWS");
+        int maxLen = readStaticIntConstant("DEFAULT_ALERT_MAX_ROW_VALUE_LENGTH");
+        int budget = readStaticIntConstant("DEFAULT_ALERT_MAX_CONTENT_BYTES");
+
+        // Wide rows: enough columns that keeping all rows overflows the byte budget
+        // even though every single value stays under the per-value character limit.
+        int columns = budget / (maxRows * (maxLen - 1)) + 5;
+        int totalRows = maxRows;
+        ArrayNode resultArray = JSONUtils.createArrayNode();
+        for (int i = 0; i < totalRows; i++) {
+            ObjectNode row = JSONUtils.createObjectNode();
+            for (int c = 0; c < columns; c++) {
+                row.put("col_" + c, repeatChar('v', maxLen - 1));
+            }
+            resultArray.add(row);
+        }
+
+        TaskExecutionContext ctx = createSqlTaskWithAlert(resultArray, 10, "wide rows test", 1);
+
+        TaskAlertInfo alertInfo = ctx.getTaskAlertInfo();
+        int contentBytes = alertInfo.getContent().getBytes(StandardCharsets.UTF_8).length;
+        Assertions.assertTrue(contentBytes <= budget,
+                "serialized alert content must stay within the byte budget: " + contentBytes);
+
+        ArrayNode contentArray = JSONUtils.parseArray(alertInfo.getContent());
+        int keptRows = contentArray.size() - 1;
+        Assertions.assertTrue(keptRows < totalRows, "rows must be dropped from the tail to fit the budget");
+        Assertions.assertTrue(contentArray.get(0).has("col_0"));
+        JsonNode last = contentArray.get(contentArray.size() - 1);
+        Assertions.assertTrue(last.has("..."));
+        Assertions.assertEquals((totalRows - keptRows) + " more rows omitted", last.get("...").asText());
+    }
+
+    @Test
+    void testPrepareTaskResultAlertBoundsTotalBytesWithMultibyteText() throws Exception {
+        int maxRows = readStaticIntConstant("DEFAULT_ALERT_MAX_ROWS");
+        int maxLen = readStaticIntConstant("DEFAULT_ALERT_MAX_ROW_VALUE_LENGTH");
+        int budget = readStaticIntConstant("DEFAULT_ALERT_MAX_CONTENT_BYTES");
+
+        // Each character is 3 UTF-8 bytes, so rows within the character limits still
+        // overflow the byte budget and rows must be dropped from the tail.
+        char cjk = '\u4e2d';
+        int columns = budget / (maxRows * 3 * maxLen) + 5;
+        int totalRows = maxRows;
+        ArrayNode resultArray = JSONUtils.createArrayNode();
+        for (int i = 0; i < totalRows; i++) {
+            ObjectNode row = JSONUtils.createObjectNode();
+            for (int c = 0; c < columns; c++) {
+                row.put("col_" + c, repeatChar(cjk, maxLen));
+            }
+            resultArray.add(row);
+        }
+
+        TaskExecutionContext ctx = createSqlTaskWithAlert(resultArray, 10, "multibyte test", 1);
+
+        TaskAlertInfo alertInfo = ctx.getTaskAlertInfo();
+        int contentBytes = alertInfo.getContent().getBytes(StandardCharsets.UTF_8).length;
+        Assertions.assertTrue(contentBytes <= budget,
+                "multibyte alert content must stay within the byte budget: " + contentBytes);
+
+        ArrayNode contentArray = JSONUtils.parseArray(alertInfo.getContent());
+        int keptRows = contentArray.size() - 1;
+        Assertions.assertTrue(keptRows < totalRows, "rows must be dropped from the tail to fit the budget");
+        // Kept values are exactly at the character limit, so they must stay complete.
+        String firstValue = contentArray.get(0).get("col_0").asText();
+        Assertions.assertEquals(repeatChar(cjk, maxLen), firstValue);
+        JsonNode last = contentArray.get(contentArray.size() - 1);
+        Assertions.assertTrue(last.has("..."));
+        Assertions.assertEquals((totalRows - keptRows) + " more rows omitted", last.get("...").asText());
+    }
+
+    @Test
+    void testPrepareTaskResultAlertReplacesRowExceedingByteBudgetAlone() throws Exception {
+        int budget = readStaticIntConstant("DEFAULT_ALERT_MAX_CONTENT_BYTES");
+
+        // Nested values are not truncated per-field, so a single row can exceed the
+        // budget alone; it must be replaced by the omission marker.
+        ObjectNode row = JSONUtils.createObjectNode();
+        row.put("id", "1");
+        ObjectNode payload = JSONUtils.createObjectNode();
+        payload.put("blob", repeatChar('n', budget * 2));
+        row.set("payload", payload);
+
+        ArrayNode resultArray = JSONUtils.createArrayNode();
+        resultArray.add(row);
+
+        TaskExecutionContext ctx = createSqlTaskWithAlert(resultArray, 10, "huge nested value test", 1);
+
+        TaskAlertInfo alertInfo = ctx.getTaskAlertInfo();
+        int contentBytes = alertInfo.getContent().getBytes(StandardCharsets.UTF_8).length;
+        Assertions.assertTrue(contentBytes <= budget);
+
+        ArrayNode contentArray = JSONUtils.parseArray(alertInfo.getContent());
+        Assertions.assertEquals(1, contentArray.size());
+        JsonNode only = contentArray.get(0);
+        Assertions.assertTrue(only.has("..."));
+        Assertions.assertEquals("1 more rows omitted", only.get("...").asText());
+    }
+
+    @Test
+    void testPrepareTaskResultAlertKeepsMaxRowsFittingExactByteBudget() throws Exception {
+        // each row {"id":"N"} serializes to 10 UTF-8 bytes and the marker row to 29 bytes,
+        // so keeping 2 rows costs exactly 53 bytes: brackets(2) + rows(20) + separator(1) + marker(30)
+        ArrayNode resultArray = JSONUtils.createArrayNode();
+        for (int i = 0; i < 5; i++) {
+            resultArray.add(JSONUtils.parseObject("{\"id\":\"" + i + "\"}"));
+        }
+
+        try (MockedStatic<PropertyUtils> propertyUtils = Mockito.mockStatic(PropertyUtils.class)) {
+            propertyUtils.when(() -> PropertyUtils.getInt("sql.task.alert.max.rows", 30)).thenReturn(5);
+            propertyUtils.when(() -> PropertyUtils.getInt("sql.task.alert.max.row.value.length", 100))
+                    .thenReturn(100);
+            propertyUtils.when(() -> PropertyUtils.getInt("sql.task.alert.max.content.bytes", 60000)).thenReturn(53);
+
+            TaskExecutionContext ctx = createSqlTaskWithAlert(resultArray, 10, "exact byte budget test", 1);
+
+            TaskAlertInfo alertInfo = ctx.getTaskAlertInfo();
+            Assertions.assertEquals("[{\"id\":\"0\"},{\"id\":\"1\"},{\"...\":\"3 more rows omitted\"}]",
+                    alertInfo.getContent());
+        }
+    }
+
+    @Test
+    void testPrepareTaskResultAlertMeasuresUtf8BytesNotChars() throws Exception {
+        // each row {"id":"中中中"} is 12 chars but 18 UTF-8 bytes, so a char-based budget
+        // check would keep 2 rows while the byte-based check keeps only 1
+        ArrayNode resultArray = JSONUtils.createArrayNode();
+        for (int i = 0; i < 5; i++) {
+            resultArray.add(JSONUtils.parseObject("{\"id\":\"" + repeatChar('\u4e2d', 3) + "\"}"));
+        }
+
+        try (MockedStatic<PropertyUtils> propertyUtils = Mockito.mockStatic(PropertyUtils.class)) {
+            propertyUtils.when(() -> PropertyUtils.getInt("sql.task.alert.max.rows", 30)).thenReturn(5);
+            propertyUtils.when(() -> PropertyUtils.getInt("sql.task.alert.max.row.value.length", 100))
+                    .thenReturn(100);
+            propertyUtils.when(() -> PropertyUtils.getInt("sql.task.alert.max.content.bytes", 60000)).thenReturn(60);
+
+            TaskExecutionContext ctx = createSqlTaskWithAlert(resultArray, 10, "utf8 bytes test", 1);
+
+            TaskAlertInfo alertInfo = ctx.getTaskAlertInfo();
+            Assertions.assertEquals(
+                    "[{\"id\":\"\u4e2d\u4e2d\u4e2d\"},{\"...\":\"4 more rows omitted\"}]",
+                    alertInfo.getContent());
+        }
+    }
+
+    private String repeatChar(char c, int count) {
+        StringBuilder builder = new StringBuilder(count);
+        for (int i = 0; i < count; i++) {
+            builder.append(c);
+        }
+        return builder.toString();
+    }
+
+    @Test
+    void testPrepareTaskResultAlertRespectsConfiguredLimits() throws Exception {
+        int configuredMaxRows = 3;
+        int configuredMaxValueLength = 10;
+        int configuredMaxBytes = 60000;
+        int totalRows = 10;
+
+        ArrayNode resultArray = JSONUtils.createArrayNode();
+        for (int i = 0; i < totalRows; i++) {
+            resultArray.add(JSONUtils.parseObject("{\"id\":\"" + i + "\"}"));
+        }
+
+        try (MockedStatic<PropertyUtils> propertyUtils = Mockito.mockStatic(PropertyUtils.class)) {
+            propertyUtils.when(() -> PropertyUtils.getInt("sql.task.alert.max.rows", 30)).thenReturn(configuredMaxRows);
+            propertyUtils.when(() -> PropertyUtils.getInt("sql.task.alert.max.row.value.length", 100))
+                    .thenReturn(configuredMaxValueLength);
+            propertyUtils.when(() -> PropertyUtils.getInt("sql.task.alert.max.content.bytes", 60000))
+                    .thenReturn(configuredMaxBytes);
+
+            TaskExecutionContext ctx = createSqlTaskWithAlert(resultArray, 10, "configured limits test", 1);
+
+            TaskAlertInfo alertInfo = ctx.getTaskAlertInfo();
+            ArrayNode contentArray = JSONUtils.parseArray(alertInfo.getContent());
+            Assertions.assertEquals(configuredMaxRows + 1, contentArray.size());
+            JsonNode last = contentArray.get(contentArray.size() - 1);
+            Assertions.assertTrue(last.has("..."));
+            Assertions.assertEquals((totalRows - configuredMaxRows) + " more rows omitted",
+                    last.get("...").asText());
+        }
+    }
+
+    private int readStaticIntConstant(String name) throws Exception {
+        Field field = SqlTask.class.getDeclaredField(name);
+        field.setAccessible(true);
+        return field.getInt(null);
+    }
+
+    @Test
+    void testResultProcessSendEmailDisabledDoesNotSetNeedAlert() throws Exception {
+        // Build a SqlTask with sendEmail = false
+        String taskParams = "{\"type\":\"HIVE\",\"datasource\":1,\"sql\":\"select 1\",\"sendEmail\":false}";
+        TaskExecutionContext ctx = new TaskExecutionContext();
+        ctx.setTaskParams(taskParams);
+        ctx.setTaskName("no_alert_task");
+        ctx.setResourceParametersHelper(getResourceParametersHelperWithDatasourceType(DbType.HIVE));
+
+        SqlTask task = new SqlTask(ctx);
+
+        ResultSet mockResultSet = mock(ResultSet.class);
+        ResultSetMetaData mockMetaData = mock(ResultSetMetaData.class);
+        when(mockResultSet.getMetaData()).thenReturn(mockMetaData);
+        when(mockMetaData.getColumnCount()).thenReturn(1);
+        when(mockMetaData.getColumnLabel(1)).thenReturn("id");
+        when(mockResultSet.next()).thenReturn(true, false);
+        when(mockResultSet.getObject(1)).thenReturn("1");
+
+        Method resultProcessMethod = SqlTask.class.getDeclaredMethod("resultProcess", ResultSet.class);
+        resultProcessMethod.setAccessible(true);
+        resultProcessMethod.invoke(task, mockResultSet);
+
+        Assertions.assertFalse(ctx.isNeedAlert());
+        Assertions.assertNull(ctx.getTaskAlertInfo());
+    }
+
+    @Test
+    void testResultProcessEmptyResultSetPreparesAlertWithEmptyRow() throws Exception {
+        String taskParams = "{\"type\":\"HIVE\",\"datasource\":1,\"sql\":\"select 1\""
+                + ",\"sendEmail\":true,\"displayRows\":10,\"groupId\":3,\"title\":\"empty result\"}";
+
+        TaskExecutionContext ctx = new TaskExecutionContext();
+        ctx.setTaskParams(taskParams);
+        ctx.setTaskName("empty_result_task");
+        ctx.setResourceParametersHelper(getResourceParametersHelperWithDatasourceType(DbType.HIVE));
+
+        SqlTask task = new SqlTask(ctx);
+
+        ResultSet mockResultSet = mock(ResultSet.class);
+        ResultSetMetaData mockMetaData = mock(ResultSetMetaData.class);
+        when(mockResultSet.getMetaData()).thenReturn(mockMetaData);
+        when(mockMetaData.getColumnCount()).thenReturn(2);
+        when(mockMetaData.getColumnLabel(1)).thenReturn("id");
+        when(mockMetaData.getColumnLabel(2)).thenReturn("name");
+        when(mockResultSet.next()).thenReturn(false); // empty result set
+
+        Method resultProcessMethod = SqlTask.class.getDeclaredMethod("resultProcess", ResultSet.class);
+        resultProcessMethod.setAccessible(true);
+        resultProcessMethod.invoke(task, mockResultSet);
+
+        Assertions.assertTrue(ctx.isNeedAlert());
+
+        TaskAlertInfo alertInfo = ctx.getTaskAlertInfo();
+        Assertions.assertNotNull(alertInfo);
+        Assertions.assertEquals(3, alertInfo.getAlertGroupId());
+        Assertions.assertEquals("empty result", alertInfo.getTitle());
+        Assertions.assertEquals(AlertType.TASK_RESULT, alertInfo.getAlertType());
+
+        ArrayNode contentArray = JSONUtils.parseArray(alertInfo.getContent());
+        Assertions.assertEquals(1, contentArray.size());
+        Assertions.assertEquals("", contentArray.get(0).get("id").asText());
+        Assertions.assertEquals("", contentArray.get(0).get("name").asText());
+    }
+
+    @Test
+    void testTaskExecutionContextCarriesAlertInfoForEventPropagation() {
+        TaskExecutionContext ctx = new TaskExecutionContext();
+        ctx.setNeedAlert(true);
+
+        TaskAlertInfo alertInfo = new TaskAlertInfo();
+        alertInfo.setTitle("test title");
+        alertInfo.setContent("[{\"id\":\"1\"}]");
+        alertInfo.setAlertGroupId(7);
+        alertInfo.setAlertType(AlertType.TASK_RESULT);
+        ctx.setTaskAlertInfo(alertInfo);
+
+        Assertions.assertTrue(ctx.isNeedAlert());
+        Assertions.assertNotNull(ctx.getTaskAlertInfo());
+        Assertions.assertEquals("test title", ctx.getTaskAlertInfo().getTitle());
+        Assertions.assertEquals(7, ctx.getTaskAlertInfo().getAlertGroupId());
+        Assertions.assertEquals(AlertType.TASK_RESULT, ctx.getTaskAlertInfo().getAlertType());
+
+        TaskExecutionContext ctx2 = new TaskExecutionContext();
+        Assertions.assertFalse(ctx2.isNeedAlert());
+        Assertions.assertNull(ctx2.getTaskAlertInfo());
     }
 
 }

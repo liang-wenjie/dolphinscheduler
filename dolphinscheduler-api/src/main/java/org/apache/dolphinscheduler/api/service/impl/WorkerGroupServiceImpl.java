@@ -22,6 +22,7 @@ import static org.apache.dolphinscheduler.api.constants.ApiFuncIdentificationCon
 
 import org.apache.dolphinscheduler.api.enums.Status;
 import org.apache.dolphinscheduler.api.exceptions.ServiceException;
+import org.apache.dolphinscheduler.api.service.MonitorService;
 import org.apache.dolphinscheduler.api.service.WorkerGroupService;
 import org.apache.dolphinscheduler.api.utils.PageInfo;
 import org.apache.dolphinscheduler.api.utils.Result;
@@ -40,8 +41,8 @@ import org.apache.dolphinscheduler.dao.entity.TaskDefinition;
 import org.apache.dolphinscheduler.dao.entity.User;
 import org.apache.dolphinscheduler.dao.entity.WorkerGroup;
 import org.apache.dolphinscheduler.dao.entity.WorkerGroupPageDetail;
-import org.apache.dolphinscheduler.dao.entity.WorkflowInstance;
 import org.apache.dolphinscheduler.dao.mapper.EnvironmentWorkerGroupRelationMapper;
+import org.apache.dolphinscheduler.dao.model.WorkflowInstanceSummaryDto;
 import org.apache.dolphinscheduler.dao.repository.ScheduleDao;
 import org.apache.dolphinscheduler.dao.repository.TaskDefinitionDao;
 import org.apache.dolphinscheduler.dao.repository.WorkerGroupDao;
@@ -85,6 +86,9 @@ public class WorkerGroupServiceImpl extends BaseServiceImpl implements WorkerGro
 
     @Autowired
     private RegistryClient registryClient;
+
+    @Autowired
+    private MonitorService monitorService;
 
     @Autowired
     private EnvironmentWorkerGroupRelationMapper environmentWorkerGroupRelationMapper;
@@ -321,12 +325,12 @@ public class WorkerGroupServiceImpl extends BaseServiceImpl implements WorkerGro
             log.error("Worker group does not exist, workerGroupId:{}.", id);
             throw new ServiceException(Status.DELETE_WORKER_GROUP_NOT_EXIST);
         }
-        List<WorkflowInstance> workflowInstances = workflowInstanceDao.queryByWorkerGroupNameAndStatus(
+        List<WorkflowInstanceSummaryDto> workflowInstances = workflowInstanceDao.queryByWorkerGroupNameAndStatus(
                 workerGroup.getName(),
                 WorkflowExecutionStatus.NOT_TERMINAL_STATES);
         if (CollectionUtils.isNotEmpty(workflowInstances)) {
             List<Integer> workflowInstanceIds =
-                    workflowInstances.stream().map(WorkflowInstance::getId).collect(Collectors.toList());
+                    workflowInstances.stream().map(WorkflowInstanceSummaryDto::getId).collect(Collectors.toList());
             log.warn(
                     "Delete worker group failed because there are {} workflowInstances are using it, workflowInstanceIds:{}.",
                     workflowInstances.size(), workflowInstanceIds);
@@ -378,7 +382,17 @@ public class WorkerGroupServiceImpl extends BaseServiceImpl implements WorkerGro
     @Override
     public List<WorkerGroupPageDetail> getConfigWorkerGroupPageDetail() {
         List<WorkerGroupPageDetail> workerGroupPageDetails = new ArrayList<>();
-        registryClient.getServerList(RegistryNodeType.WORKER).forEach(server -> {
+        List<Server> servers = monitorService.listServer(RegistryNodeType.WORKER);
+        List<String> unavailableAddresses = servers.stream()
+                .filter(server -> server.getHeartBeatInfo() == null)
+                .map(server -> server.getHost() + Constants.COLON + server.getPort())
+                .collect(Collectors.toList());
+        if (!unavailableAddresses.isEmpty()) {
+            throw new ServiceException(Status.QUERY_WORKER_GROUP_FAIL.getCode(),
+                    Status.QUERY_WORKER_GROUP_FAIL.getMsg() + ": heartbeat metadata unavailable for workers "
+                            + String.join(", ", unavailableAddresses));
+        }
+        servers.forEach(server -> {
             WorkerGroupPageDetail workerGroupPageDetail = new WorkerGroupPageDetail();
             WorkerHeartBeat workerHeartBeat = JSONUtils.parseObject(server.getHeartBeatInfo(), WorkerHeartBeat.class);
             workerGroupPageDetail.setName(workerHeartBeat.getWorkerGroup());

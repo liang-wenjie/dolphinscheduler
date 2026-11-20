@@ -174,7 +174,7 @@ DolphinScheduler默认使用Zookeeper进行集群管理、容错、事件监听�
 | registry.zookeeper.session-timeout              | 30s              | session超时时间                                                                                                                                                |
 | registry.zookeeper.connection-timeout           | 30s              | 连接超时时间                                                                                                                                                     |
 | registry.zookeeper.block-until-connected        | 600ms            | 阻塞直到连接成功的等待时间                                                                                                                                              |
-| registry.zookeeper.digest                       | {用户名:密码}         | 如果zookeeper打开了acl，则需要填写认证信息访问znode，认证信息格式为{用户名}:{密码}。关于Zookeeper ACL详见[https://zookeeper.apache.org/doc/r3.4.14/zookeeperAdmin.html](Apache Zookeeper官方文档) |
+| registry.zookeeper.digest                       | {用户名:密码}         | 如果zookeeper打开了acl，则需要填写认证信息访问znode，认证信息格式为{用户名}:{密码}。关于Zookeeper ACL详见[Apache Zookeeper官方文档](https://zookeeper.apache.org/doc/r3.4.14/zookeeperAdmin.html) |
 
 DolphinScheduler同样可以通过`bin/env/dolphinscheduler_env.sh`进行Zookeeper相关的配置。
 
@@ -223,6 +223,9 @@ common.properties配置文件目前主要是配置hadoop/s3/yarn/applicationId�
 | sudo.enable                                   | true                                             | 是否开启sudo                                                                                                                                                                                                             |
 | zeppelin.rest.url                             | http://localhost:8080                            | zeppelin RESTful API 接口地址                                                                                                                                                                                            |
 | appId.collect                                 | log                                              | 收集applicationId方式， 如果用aop方法，将配置log替换为aop，并将`bin/env/dolphinscheduler_env.sh`自动收集applicationId相关环境变量配置的注释取消掉，注意：aop不支持远程主机提交yarn作业的方式比如Beeline客户端提交，且如果用户环境覆盖了dolphinscheduler_env.sh收集applicationId相关环境变量配置，aop方法会失效 |
+| sql.task.alert.max.rows                       | 30                                               | SQL 任务结果告警内容最多保留的行数，超出的行以省略标记表示。修改后需重启 Worker Server 生效                                                                                                                                                              |
+| sql.task.alert.max.row.value.length           | 100                                              | SQL 任务结果告警内容中单个字符串字段值最多保留的字符数，超出的值以省略号截断。修改后需重启 Worker Server 生效                                                                                                                                                     |
+| sql.task.alert.max.content.bytes              | 60000                                            | SQL 任务结果告警内容序列化后的最大 UTF-8 字节数，小于存储告警内容的 MySQL TEXT 列 65535 字节容量。修改后需重启 Worker Server 生效                                                                                                                              |
 
 ## Api-server相关配置
 
@@ -260,6 +263,7 @@ common.properties配置文件目前主要是配置hadoop/s3/yarn/applicationId�
 | casdoor.organization-name                             |                                      | Casdoor中的组织名称                                   |
 | casdoor.application-name                              |                                      | Casdoor中的应用名称                                   |
 | casdoor.redirect-url                                  |                                      | dolphinscheduler登录URL                           |
+| api.session-timeout                                   | 2h                                   | 登录会话有效期，从登录时刻开始计算，支持 Duration 格式（如 30m、12h、1d）  |
 | api.traffic.control.global.switch                     | false                                | 流量控制全局开关                                        |
 | api.traffic.control.max-global-qps-rate               | 300                                  | 全局最大请求数/秒                                       |
 | api.traffic.control.tenant-switch                     | false                                | 流量控制租户开关                                        |
@@ -277,7 +281,8 @@ common.properties配置文件目前主要是配置hadoop/s3/yarn/applicationId�
 | master.exec-threads                                                         | 100                          | master工作线程数量,用于限制并行的流程实例数量                                                              |
 | master.dispatch-task-number                                                 | 3                            | master每个批次的派发任务数量                                                                       |
 | master.worker-load-balancer-configuration-properties.type                   | DYNAMIC_WEIGHTED_ROUND_ROBIN | Master 将会使用Worker的动态CPU/Memory/线程池使用率来计算Worker的负载，负载越低的worker将会有更高的机会被分发任务              |
-| master.max-heartbeat-interval                                               | 10s                          | master最大心跳间隔                                                                            |
+| master.max-heartbeat-interval                                               | 10s                          | 检查 failover 标记的最大间隔                                                                     |
+| master.heartbeat-fetch-interval                                             | 3s                           | 服务间心跳数据拉取间隔，必须大于零                                                                       |
 | master.task-commit-retry-times                                              | 5                            | 任务重试次数                                                                                  |
 | master.task-commit-interval                                                 | 1000                         | 任务提交间隔,单位为毫秒                                                                            |
 | master.state-wheel-interval                                                 | 5                            | 轮询检查状态时间                                                                                |
@@ -303,7 +308,7 @@ common.properties配置文件目前主要是配置hadoop/s3/yarn/applicationId�
 |    默认值    |                                     参数                                      |                                           描述                                            |
 |-----------|-----------------------------------------------------------------------------|-----------------------------------------------------------------------------------------|
 | 1234      | worker.listen-port                                                          | worker监听端口                                                                              |
-| 10s       | worker.max-heartbeat-interval                                               | worker最大心跳间隔                                                                            |
+| 10s       | worker.max-heartbeat-interval                                               | 检查 failover 标记的最大间隔                                                                     |
 | 100       | worker.host-weight                                                          | 派发任务时，worker主机的权重                                                                       |
 | true      | worker.tenant-auto-create                                                   | 租户对应于系统的用户,由worker提交作业.如果系统没有该用户,则在参数worker.tenant.auto.create为true后自动创建。               |
 | true      | worker.server-load-protection.enabled                                       | 是否开启系统保护策略                                                                              |
@@ -373,7 +378,7 @@ common.properties配置文件目前主要是配置hadoop/s3/yarn/applicationId�
 
 ## dolphinscheduler_env.sh [环境变量配置]
 
-通过类似shell方式提交任务的的时候，会加载该配置文件中的环境变量到主机中。涉及到的 `JAVA_HOME`
+通过类似shell方式提交任务的时候，会加载该配置文件中的环境变量到主机中。涉及到的 `JAVA_HOME`
 任务类型的环境配置，其中任务类型主要有: Shell任务、Python任务、Spark任务、Flink任务、Datax任务等等。
 
 ```bash

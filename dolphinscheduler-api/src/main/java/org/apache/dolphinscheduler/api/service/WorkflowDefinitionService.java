@@ -21,6 +21,7 @@ import org.apache.dolphinscheduler.api.dto.treeview.TreeViewDto;
 import org.apache.dolphinscheduler.api.dto.workflow.WorkflowDefinitionVariablesDTO;
 import org.apache.dolphinscheduler.api.utils.PageInfo;
 import org.apache.dolphinscheduler.api.utils.Result;
+import org.apache.dolphinscheduler.api.vo.WorkflowDefinitionCopyVO;
 import org.apache.dolphinscheduler.common.enums.WorkflowExecutionTypeEnum;
 import org.apache.dolphinscheduler.dao.entity.DagData;
 import org.apache.dolphinscheduler.dao.entity.DependentSimplifyDefinition;
@@ -28,6 +29,7 @@ import org.apache.dolphinscheduler.dao.entity.TaskDefinition;
 import org.apache.dolphinscheduler.dao.entity.TaskDefinitionLog;
 import org.apache.dolphinscheduler.dao.entity.User;
 import org.apache.dolphinscheduler.dao.entity.WorkflowDefinition;
+import org.apache.dolphinscheduler.dao.entity.WorkflowDefinitionLog;
 
 import java.util.List;
 import java.util.Map;
@@ -73,7 +75,9 @@ public interface WorkflowDefinitionService {
                                                                    String otherParamsJson,
                                                                    Integer userId,
                                                                    Integer pageNo,
-                                                                   Integer pageSize);
+                                                                   Integer pageSize,
+                                                                   String sortField,
+                                                                   String sortOrder);
 
     /**
      * query detail of workflow definition
@@ -97,10 +101,10 @@ public interface WorkflowDefinitionService {
     /**
      * batch copy workflow definition
      */
-    void batchCopyWorkflowDefinition(User loginUser,
-                                     long projectCode,
-                                     String codes,
-                                     long targetProjectCode);
+    List<WorkflowDefinitionCopyVO> batchCopyWorkflowDefinition(User loginUser,
+                                                               long projectCode,
+                                                               String codes,
+                                                               long targetProjectCode);
 
     /**
      * batch move workflow definition
@@ -195,11 +199,11 @@ public interface WorkflowDefinitionService {
     /**
      * query the pagination versions info by one certain workflow definition code
      */
-    Result queryWorkflowDefinitionVersions(User loginUser,
-                                           long projectCode,
-                                           int pageNo,
-                                           int pageSize,
-                                           long code);
+    Result<PageInfo<WorkflowDefinitionLog>> queryWorkflowDefinitionVersions(User loginUser,
+                                                                            long projectCode,
+                                                                            int pageNo,
+                                                                            int pageSize,
+                                                                            long code);
 
     /**
      * delete one certain workflow definition by version number and workflow definition code

@@ -73,6 +73,10 @@ public class HttpTask extends AbstractTask {
 
     @Override
     public void handle(TaskCallBack taskCallBack) throws TaskException {
+        // Resolve ${...} / $[...] placeholders in the URL with the same parameter map used for
+        // headers, query parameters and body; otherwise the raw template is used as the host.
+        httpParameters.setUrl(ParameterUtils.convertParameterPlaceholders(httpParameters.getUrl(),
+                ParameterUtils.convert(taskExecutionContext.getPrepareParamsMap())));
 
         OkHttpResponse httpResponse = sendRequest();
 
@@ -154,7 +158,8 @@ public class HttpTask extends AbstractTask {
 
         OkHttpResponse okHttpResponse = OkHttpUtils.get(httpParameters.getUrl(), okHttpRequestHeaders,
                 requestParams, httpParameters.getConnectTimeout(),
-                httpParameters.getConnectTimeout(), httpParameters.getConnectTimeout());
+                httpParameters.getConnectTimeout(), httpParameters.getConnectTimeout(),
+                httpParameters.isSocketKeepAlive());
         addDefaultOutput(JSONUtils.toJsonString(okHttpResponse));
         return okHttpResponse;
     }
@@ -164,11 +169,13 @@ public class HttpTask extends AbstractTask {
         OkHttpRequestHeaders okHttpRequestHeaders = new OkHttpRequestHeaders();
         okHttpRequestHeaders.setHeaders(getHeaders());
         okHttpRequestHeaders.setOkHttpRequestHeaderContentType(getContentType());
+        Map<String, Object> requestParams = getRequestParams();
         Map<String, Object> requestBody = getRequestBody();
 
-        OkHttpResponse okHttpResponse = OkHttpUtils.post(httpParameters.getUrl(), okHttpRequestHeaders, null,
+        OkHttpResponse okHttpResponse = OkHttpUtils.post(httpParameters.getUrl(), okHttpRequestHeaders, requestParams,
                 requestBody, httpParameters.getConnectTimeout(),
-                httpParameters.getConnectTimeout(), httpParameters.getConnectTimeout());
+                httpParameters.getConnectTimeout(), httpParameters.getConnectTimeout(),
+                httpParameters.isSocketKeepAlive());
         addDefaultOutput(JSONUtils.toJsonString(okHttpResponse));
         return okHttpResponse;
     }
@@ -178,11 +185,13 @@ public class HttpTask extends AbstractTask {
         OkHttpRequestHeaders okHttpRequestHeaders = new OkHttpRequestHeaders();
         okHttpRequestHeaders.setHeaders(getHeaders());
         okHttpRequestHeaders.setOkHttpRequestHeaderContentType(getContentType());
+        Map<String, Object> requestParams = getRequestParams();
         Map<String, Object> requestBody = getRequestBody();
 
-        OkHttpResponse okHttpResponse = OkHttpUtils.put(httpParameters.getUrl(), okHttpRequestHeaders,
+        OkHttpResponse okHttpResponse = OkHttpUtils.put(httpParameters.getUrl(), okHttpRequestHeaders, requestParams,
                 requestBody, httpParameters.getConnectTimeout(),
-                httpParameters.getConnectTimeout(), httpParameters.getConnectTimeout());
+                httpParameters.getConnectTimeout(), httpParameters.getConnectTimeout(),
+                httpParameters.isSocketKeepAlive());
         addDefaultOutput(JSONUtils.toJsonString(okHttpResponse));
         return okHttpResponse;
     }
@@ -192,10 +201,11 @@ public class HttpTask extends AbstractTask {
         OkHttpRequestHeaders okHttpRequestHeaders = new OkHttpRequestHeaders();
         okHttpRequestHeaders.setHeaders(getHeaders());
         okHttpRequestHeaders.setOkHttpRequestHeaderContentType(getContentType());
+        Map<String, Object> requestParams = getRequestParams();
 
-        OkHttpResponse okHttpResponse = OkHttpUtils.delete(httpParameters.getUrl(), okHttpRequestHeaders,
+        OkHttpResponse okHttpResponse = OkHttpUtils.delete(httpParameters.getUrl(), okHttpRequestHeaders, requestParams,
                 httpParameters.getConnectTimeout(), httpParameters.getConnectTimeout(),
-                httpParameters.getConnectTimeout());
+                httpParameters.getConnectTimeout(), httpParameters.isSocketKeepAlive());
         addDefaultOutput(JSONUtils.toJsonString(okHttpResponse));
         return okHttpResponse;
     }

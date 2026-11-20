@@ -22,9 +22,6 @@ import static org.apache.dolphinscheduler.api.constants.ApiFuncIdentificationCon
 import static org.apache.dolphinscheduler.api.constants.ApiFuncIdentificationConstant.WORKFLOW_BATCH_COPY;
 import static org.apache.dolphinscheduler.api.constants.ApiFuncIdentificationConstant.WORKFLOW_CREATE;
 import static org.apache.dolphinscheduler.api.constants.ApiFuncIdentificationConstant.WORKFLOW_DEFINITION;
-import static org.apache.dolphinscheduler.api.constants.ApiFuncIdentificationConstant.WORKFLOW_DEFINITION_DELETE;
-import static org.apache.dolphinscheduler.api.constants.ApiFuncIdentificationConstant.WORKFLOW_ONLINE_OFFLINE;
-import static org.apache.dolphinscheduler.api.constants.ApiFuncIdentificationConstant.WORKFLOW_SWITCH_TO_THIS_VERSION;
 import static org.apache.dolphinscheduler.api.constants.ApiFuncIdentificationConstant.WORKFLOW_TREE_VIEW;
 import static org.apache.dolphinscheduler.api.enums.Status.WORKFLOW_DEFINITION_NOT_EXIST;
 import static org.apache.dolphinscheduler.common.constants.CommandKeyConstants.CMD_PARAM_SUB_WORKFLOW_DEFINITION_CODE;
@@ -40,6 +37,8 @@ import org.apache.dolphinscheduler.api.dto.treeview.TreeViewDto;
 import org.apache.dolphinscheduler.api.dto.workflow.WorkflowDefinitionVariablesDTO;
 import org.apache.dolphinscheduler.api.enums.Status;
 import org.apache.dolphinscheduler.api.exceptions.ServiceException;
+import org.apache.dolphinscheduler.api.permission.TaskDatasourcePermissionChecker;
+import org.apache.dolphinscheduler.api.permission.TaskSubWorkflowPermissionChecker;
 import org.apache.dolphinscheduler.api.service.ProjectService;
 import org.apache.dolphinscheduler.api.service.SchedulerService;
 import org.apache.dolphinscheduler.api.service.TaskDefinitionLogService;
@@ -50,7 +49,9 @@ import org.apache.dolphinscheduler.api.service.WorkflowLineageService;
 import org.apache.dolphinscheduler.api.utils.CheckUtils;
 import org.apache.dolphinscheduler.api.utils.PageInfo;
 import org.apache.dolphinscheduler.api.utils.Result;
+import org.apache.dolphinscheduler.api.utils.SensitivePropertyUtils;
 import org.apache.dolphinscheduler.api.validator.GlobalParamsValidator;
+import org.apache.dolphinscheduler.api.vo.WorkflowDefinitionCopyVO;
 import org.apache.dolphinscheduler.common.constants.Constants;
 import org.apache.dolphinscheduler.common.enums.ReleaseState;
 import org.apache.dolphinscheduler.common.enums.UserType;
@@ -73,7 +74,6 @@ import org.apache.dolphinscheduler.dao.entity.User;
 import org.apache.dolphinscheduler.dao.entity.UserWithWorkflowDefinitionCode;
 import org.apache.dolphinscheduler.dao.entity.WorkflowDefinition;
 import org.apache.dolphinscheduler.dao.entity.WorkflowDefinitionLog;
-import org.apache.dolphinscheduler.dao.entity.WorkflowInstance;
 import org.apache.dolphinscheduler.dao.entity.WorkflowTaskLineage;
 import org.apache.dolphinscheduler.dao.entity.WorkflowTaskRelation;
 import org.apache.dolphinscheduler.dao.entity.WorkflowTaskRelationLog;
@@ -81,6 +81,7 @@ import org.apache.dolphinscheduler.dao.mapper.TaskDefinitionLogMapper;
 import org.apache.dolphinscheduler.dao.mapper.WorkflowDefinitionLogMapper;
 import org.apache.dolphinscheduler.dao.mapper.WorkflowTaskRelationLogMapper;
 import org.apache.dolphinscheduler.dao.model.PageListingResult;
+import org.apache.dolphinscheduler.dao.model.WorkflowInstanceSummaryDto;
 import org.apache.dolphinscheduler.dao.repository.ProjectDao;
 import org.apache.dolphinscheduler.dao.repository.ScheduleDao;
 import org.apache.dolphinscheduler.dao.repository.TaskDefinitionDao;
@@ -99,6 +100,7 @@ import org.apache.dolphinscheduler.plugin.task.api.model.SwitchResultVo;
 import org.apache.dolphinscheduler.plugin.task.api.parameters.ConditionsParameters;
 import org.apache.dolphinscheduler.plugin.task.api.parameters.DependentParameters;
 import org.apache.dolphinscheduler.plugin.task.api.parameters.SwitchParameters;
+import org.apache.dolphinscheduler.plugin.task.api.utils.GlobalParameterUtils;
 import org.apache.dolphinscheduler.plugin.task.api.utils.TaskTypeUtils;
 import org.apache.dolphinscheduler.service.model.TaskNode;
 import org.apache.dolphinscheduler.service.process.ProcessService;
@@ -209,6 +211,12 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
     @Autowired
     private GlobalParamsValidator globalParamsValidator;
 
+    @Autowired
+    private TaskDatasourcePermissionChecker taskDatasourcePermissionChecker;
+
+    @Autowired
+    private TaskSubWorkflowPermissionChecker taskSubWorkflowPermissionChecker;
+
     /**
      * create workflow definition
      *
@@ -257,6 +265,11 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
 
         List<TaskDefinitionLog> taskDefinitionLogs = generateTaskDefinitionList(taskDefinitionJson);
         List<WorkflowTaskRelationLog> taskRelationList = generateTaskRelationList(taskRelationJson, taskDefinitionLogs);
+        SensitivePropertyUtils.requireNoPlaceholder(GlobalParameterUtils.deserializeGlobalParameter(globalParams));
+        for (TaskDefinitionLog taskDefinitionLog : CollectionUtils.emptyIfNull(taskDefinitionLogs)) {
+            taskDefinitionLog.setTaskParams(
+                    SensitivePropertyUtils.mergeLocalParams(taskDefinitionLog.getTaskParams(), null));
+        }
 
         long workflowDefinitionCode = CodeGenerateUtils.genCode();
         WorkflowDefinition workflowDefinition =
@@ -271,6 +284,8 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
                                                  List<WorkflowTaskRelationLog> taskRelationList,
                                                  WorkflowDefinition workflowDefinition,
                                                  List<TaskDefinitionLog> taskDefinitionLogs) {
+        taskDatasourcePermissionChecker.checkPermission(loginUser, taskDefinitionLogs);
+        taskSubWorkflowPermissionChecker.checkPermission(loginUser, taskDefinitionLogs);
         int saveTaskResult = processService.saveTaskDefine(loginUser, workflowDefinition.getProjectCode(),
                 taskDefinitionLogs, Boolean.TRUE);
         if (saveTaskResult == Constants.EXIT_CODE_SUCCESS) {
@@ -396,6 +411,26 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
                             JSONUtils.toJsonString(workflowTaskRelationLog),
                             WorkflowTaskRelation.class))
                     .collect(Collectors.toList());
+            // Check that both the pre and post taskCodes in taskRelation exist in taskDefinition,
+            // otherwise transformTask will be broken by missing task definitions
+            Set<Long> taskDefinitionCodes =
+                    taskDefinitionLogs.stream().map(TaskDefinitionLog::getCode).collect(Collectors.toSet());
+            Set<Long> missedTaskCodes = new HashSet<>();
+            for (WorkflowTaskRelationLog workflowTaskRelationLog : taskRelationList) {
+                if (!taskDefinitionCodes.contains(workflowTaskRelationLog.getPostTaskCode())) {
+                    missedTaskCodes.add(workflowTaskRelationLog.getPostTaskCode());
+                }
+                if (workflowTaskRelationLog.getPreTaskCode() != 0L
+                        && !taskDefinitionCodes.contains(workflowTaskRelationLog.getPreTaskCode())) {
+                    missedTaskCodes.add(workflowTaskRelationLog.getPreTaskCode());
+                }
+            }
+            if (CollectionUtils.isNotEmpty(missedTaskCodes)) {
+                String taskCodes = StringUtils.join(missedTaskCodes, Constants.COMMA);
+                log.error("Task definitions do not exist, taskCodes:{}.", taskCodes);
+                throw new ServiceException(Status.WORKFLOW_DAG_IS_INVALID,
+                        "the task definitions of taskCodes: [" + taskCodes + "] do not exist");
+            }
             List<TaskNode> taskNodeList = processService.transformTask(workflowTaskRelations, taskDefinitionLogs);
             if (taskNodeList.size() != taskRelationList.size()) {
                 Set<Long> postTaskCodes = taskRelationList.stream().map(WorkflowTaskRelationLog::getPostTaskCode)
@@ -405,7 +440,8 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
                 if (CollectionUtils.isNotEmpty(codes)) {
                     String taskCodes = StringUtils.join(codes, Constants.COMMA);
                     log.error("Task definitions do not exist, taskCodes:{}.", taskCodes);
-                    throw new ServiceException(Status.TASK_DEFINE_NOT_EXIST, taskCodes);
+                    throw new ServiceException(Status.WORKFLOW_DAG_IS_INVALID,
+                            "the task definitions of taskCodes: [" + taskCodes + "] do not exist");
                 }
             }
             if (graphHasCycle(taskNodeList)) {
@@ -492,14 +528,16 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
                                                                           String otherParamsJson,
                                                                           Integer userId,
                                                                           Integer pageNo,
-                                                                          Integer pageSize) {
+                                                                          Integer pageSize,
+                                                                          String sortField,
+                                                                          String sortOrder) {
 
         // check user access for project
         projectService.checkProjectAndAuthThrowException(loginUser, projectCode, WORKFLOW_DEFINITION);
 
         PageListingResult<WorkflowDefinition> workflowDefinitionPageListingResult =
                 workflowDefinitionDao.listingWorkflowDefinition(
-                        pageNo, pageSize, searchVal, userId, projectCode);
+                        pageNo, pageSize, searchVal, userId, projectCode, sortField, sortOrder);
         List<WorkflowDefinition> workflowDefinitions = workflowDefinitionPageListingResult.getRecords();
 
         List<Long> workflowDefinitionCodes =
@@ -649,6 +687,34 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
                 throw new ServiceException(Status.WORKFLOW_DEFINITION_NAME_EXIST, name);
             }
         }
+        List<Property> submittedGlobalParams =
+                GlobalParameterUtils.deserializeGlobalParameter(globalParams);
+        if (CollectionUtils.isNotEmpty(submittedGlobalParams)) {
+            globalParams = GlobalParameterUtils.serializeGlobalParameter(
+                    SensitivePropertyUtils.merge(submittedGlobalParams,
+                            GlobalParameterUtils.deserializeGlobalParameter(workflowDefinition.getGlobalParams())));
+        }
+        List<TaskDefinition> versionKeys = new ArrayList<>();
+        for (TaskDefinitionLog taskDefinitionLog : CollectionUtils.emptyIfNull(taskDefinitionLogs)) {
+            if (taskDefinitionLog.getCode() > 0 && taskDefinitionLog.getVersion() > 0) {
+                versionKeys.add(new TaskDefinition(taskDefinitionLog.getCode(), taskDefinitionLog.getVersion()));
+            }
+        }
+        List<TaskDefinitionLog> existingTaskLogs = CollectionUtils.isEmpty(versionKeys)
+                ? Collections.emptyList()
+                : taskDefinitionLogMapper.queryByTaskDefinitions(versionKeys);
+        Map<String, String> existingTaskParamsMap = existingTaskLogs.stream()
+                .collect(Collectors.toMap(
+                        log -> log.getCode() + "_" + log.getVersion(),
+                        TaskDefinitionLog::getTaskParams,
+                        (left, right) -> left));
+        for (TaskDefinitionLog submitted : CollectionUtils.emptyIfNull(taskDefinitionLogs)) {
+            String existingTaskParams = submitted.getCode() <= 0 || submitted.getVersion() <= 0
+                    ? null
+                    : existingTaskParamsMap.get(submitted.getCode() + "_" + submitted.getVersion());
+            submitted.setTaskParams(SensitivePropertyUtils.mergeLocalParams(
+                    submitted.getTaskParams(), existingTaskParams));
+        }
         WorkflowDefinition workflowDefinitionDeepCopy =
                 JSONUtils.parseObject(JSONUtils.toJsonString(workflowDefinition), WorkflowDefinition.class);
         workflowDefinition.set(projectCode, name, description, globalParams, locations, timeout);
@@ -694,6 +760,8 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
                                                  WorkflowDefinition workflowDefinition,
                                                  WorkflowDefinition workflowDefinitionDeepCopy,
                                                  List<TaskDefinitionLog> taskDefinitionLogs) {
+        taskDatasourcePermissionChecker.checkPermission(loginUser, taskDefinitionLogs);
+        taskSubWorkflowPermissionChecker.checkPermission(loginUser, taskDefinitionLogs);
         int saveTaskResult = processService.saveTaskDefine(loginUser, workflowDefinition.getProjectCode(),
                 taskDefinitionLogs, Boolean.TRUE);
         if (saveTaskResult == Constants.EXIT_CODE_SUCCESS) {
@@ -841,8 +909,9 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
         }
 
         // check workflow instances is already running
-        List<WorkflowInstance> workflowInstances = workflowInstanceService.queryByWorkflowDefinitionCodeAndStatus(
-                workflowDefinition.getCode(), WorkflowExecutionStatus.NOT_TERMINAL_STATES);
+        List<WorkflowInstanceSummaryDto> workflowInstances =
+                workflowInstanceService.queryByWorkflowDefinitionCodeAndStatus(
+                        workflowDefinition.getCode(), WorkflowExecutionStatus.NOT_TERMINAL_STATES);
         if (CollectionUtils.isNotEmpty(workflowInstances)) {
             throw new ServiceException(Status.DELETE_WORKFLOW_DEFINITION_EXECUTING_FAIL, workflowInstances.size());
         }
@@ -863,8 +932,7 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
                 .orElseThrow(() -> new ServiceException(WORKFLOW_DEFINITION_NOT_EXIST, String.valueOf(code)));
 
         Project project = projectDao.queryByCode(workflowDefinition.getProjectCode());
-        // check user access for project
-        projectService.checkProjectAndAuthThrowException(loginUser, project, WORKFLOW_DEFINITION_DELETE);
+        projectService.checkHasProjectWritePermissionThrowException(loginUser, project);
 
         // Determine if the login user is the owner of the workflow definition
         if (loginUser.getId() != workflowDefinition.getUserId() && loginUser.getUserType() != UserType.ADMIN_USER) {
@@ -933,7 +1001,15 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
             List<WorkflowTaskRelation> taskRelationList =
                     JSONUtils.toList(workflowTaskRelationJson, WorkflowTaskRelation.class);
             // Check whether the task node is normal
-            List<TaskNode> taskNodes = processService.transformTask(taskRelationList, taskDefinitionLogsList);
+            List<TaskNode> taskNodes;
+            try {
+                taskNodes = processService.transformTask(taskRelationList, taskDefinitionLogsList);
+            } catch (org.apache.dolphinscheduler.service.exceptions.ServiceException e) {
+                // transformTask reports exactly what makes the dag inconsistent, e.g.
+                // task codes referenced by relations but missing in task definitions
+                log.error("Failed to build the workflow dag from the given workflowTaskRelationJson", e);
+                throw new ServiceException(Status.WORKFLOW_DAG_IS_INVALID, e.getMessage());
+            }
 
             if (CollectionUtils.isEmpty(taskNodes)) {
                 log.error("Task node data is empty.");
@@ -1118,7 +1194,7 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
         Map<Long, List<TreeViewDto>> waitingRunningNodeMap = new ConcurrentHashMap<>();
 
         // List of workflow instances
-        List<WorkflowInstance> workflowInstanceList =
+        List<WorkflowInstanceSummaryDto> workflowInstanceList =
                 workflowInstanceService.queryByWorkflowDefinitionCode(code, limit);
         workflowInstanceList.forEach(workflowInstance -> workflowInstance
                 .setDuration(
@@ -1141,7 +1217,7 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
         parentTreeViewDto.setCode(0L);
         // Specify the workflow definition, because it is a TreeView for a workflow definition
         for (int i = limit - 1; i >= 0; i--) {
-            WorkflowInstance workflowInstance = workflowInstanceList.get(i);
+            WorkflowInstanceSummaryDto workflowInstance = workflowInstanceList.get(i);
             Date endTime = workflowInstance.getEndTime() == null ? new Date() : workflowInstance.getEndTime();
             parentTreeViewDto.getInstances()
                     .add(new Instance(workflowInstance.getId(), workflowInstance.getName(),
@@ -1173,7 +1249,7 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
                 treeViewDto.setName(taskNode.getName());
                 // set treeViewDto instances
                 for (int i = limit - 1; i >= 0; i--) {
-                    WorkflowInstance workflowInstance = workflowInstanceList.get(i);
+                    WorkflowInstanceSummaryDto workflowInstance = workflowInstanceList.get(i);
                     TaskInstance taskInstance =
                             taskInstanceDao.queryByWorkflowInstanceIdAndTaskCode(workflowInstance.getId(), nodeCode);
                     if (taskInstance == null) {
@@ -1260,14 +1336,18 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
      */
     @Override
     @Transactional
-    public void batchCopyWorkflowDefinition(User loginUser,
-                                            long projectCode,
-                                            String codes,
-                                            long targetProjectCode) {
-        checkParams(loginUser, projectCode, codes, targetProjectCode, WORKFLOW_BATCH_COPY);
+    public List<WorkflowDefinitionCopyVO> batchCopyWorkflowDefinition(User loginUser,
+                                                                      long projectCode,
+                                                                      String codes,
+                                                                      long targetProjectCode) {
+        checkParams(loginUser, projectCode, codes, targetProjectCode, WORKFLOW_BATCH_COPY, false);
         List<String> failedWorkflowList = new ArrayList<>();
-        doBatchOperateWorkflowDefinition(loginUser, targetProjectCode, failedWorkflowList, codes, true);
+        List<WorkflowDefinition> sourceWorkflowDefinitions = querySourceWorkflowDefinitions(
+                projectCode, codes, failedWorkflowList);
+        List<WorkflowDefinitionCopyVO> copyResponses = copyWorkflowDefinitions(
+                loginUser, targetProjectCode, sourceWorkflowDefinitions, failedWorkflowList);
         checkBatchOperateResult(projectCode, targetProjectCode, failedWorkflowList, true);
+        return copyResponses;
     }
 
     /**
@@ -1285,24 +1365,31 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
                                             long projectCode,
                                             String codes,
                                             long targetProjectCode) {
-        checkParams(loginUser, projectCode, codes, targetProjectCode, TASK_DEFINITION_MOVE);
+        checkParams(loginUser, projectCode, codes, targetProjectCode, TASK_DEFINITION_MOVE, true);
         if (projectCode == targetProjectCode) {
             log.warn("Project code is same as target project code, projectCode:{}.", projectCode);
             return;
         }
 
         List<String> failedWorkflowList = new ArrayList<>();
-        doBatchOperateWorkflowDefinition(loginUser, targetProjectCode, failedWorkflowList, codes, false);
+        List<WorkflowDefinition> sourceWorkflowDefinitions = querySourceWorkflowDefinitions(
+                projectCode, codes, failedWorkflowList);
+        moveWorkflowDefinitions(loginUser, targetProjectCode, sourceWorkflowDefinitions, failedWorkflowList);
         checkBatchOperateResult(projectCode, targetProjectCode, failedWorkflowList, false);
     }
 
     private void checkParams(User loginUser,
                              long projectCode,
                              String workflowDefinitionCodes,
-                             long targetProjectCode, String perm) {
+                             long targetProjectCode,
+                             String perm,
+                             boolean requireSourceWritePermission) {
         Project project = projectDao.queryByCode(projectCode);
-        // check user access for project
-        projectService.checkProjectAndAuthThrowException(loginUser, project, perm);
+        if (requireSourceWritePermission) {
+            projectService.checkHasProjectWritePermissionThrowException(loginUser, project);
+        } else {
+            projectService.checkProjectAndAuthThrowException(loginUser, project, perm);
+        }
 
         if (StringUtils.isEmpty(workflowDefinitionCodes)) {
             log.error("Parameter workflowDefinitionCodes is empty, projectCode is {}.", projectCode);
@@ -1311,114 +1398,137 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
 
         if (projectCode != targetProjectCode) {
             Project targetProject = projectDao.queryByCode(targetProjectCode);
-            // check user access for project
-            projectService.checkProjectAndAuthThrowException(loginUser, targetProject, perm);
+            projectService.checkHasProjectWritePermissionThrowException(loginUser, targetProject);
+        } else if (!requireSourceWritePermission) {
+            projectService.checkHasProjectWritePermissionThrowException(loginUser, project);
         }
     }
 
-    protected void doBatchOperateWorkflowDefinition(User loginUser,
-                                                    long targetProjectCode,
-                                                    List<String> failedWorkflowList,
-                                                    String workflowDefinitionCodes,
-                                                    boolean isCopy) {
+    private List<WorkflowDefinition> querySourceWorkflowDefinitions(long sourceProjectCode,
+                                                                    String workflowDefinitionCodes,
+                                                                    List<String> failedWorkflowList) {
         Set<Long> definitionCodes = Arrays.stream(workflowDefinitionCodes.split(Constants.COMMA)).map(Long::parseLong)
                 .collect(Collectors.toSet());
-        List<WorkflowDefinition> workflowDefinitionList = workflowDefinitionDao.queryByCodes(definitionCodes);
-        Set<Long> queryCodes =
-                workflowDefinitionList.stream().map(WorkflowDefinition::getCode).collect(Collectors.toSet());
-        // definitionCodes - queryCodes
-        Set<Long> diffCode =
+        List<WorkflowDefinition> workflowDefinitions = workflowDefinitionDao.queryByCodes(definitionCodes);
+        List<WorkflowDefinition> sourceWorkflowDefinitions = workflowDefinitions.stream()
+                .filter(workflowDefinition -> workflowDefinition.getProjectCode() == sourceProjectCode)
+                .collect(Collectors.toList());
+        Set<Long> queryCodes = sourceWorkflowDefinitions.stream().map(WorkflowDefinition::getCode)
+                .collect(Collectors.toSet());
+        Set<Long> diffCodes =
                 definitionCodes.stream().filter(code -> !queryCodes.contains(code)).collect(Collectors.toSet());
-        diffCode.forEach(code -> failedWorkflowList.add(code + "[null]"));
-        for (WorkflowDefinition workflowDefinition : workflowDefinitionList) {
+        diffCodes.forEach(code -> failedWorkflowList.add(code + "[null]"));
+        return sourceWorkflowDefinitions;
+    }
+
+    private List<WorkflowDefinitionCopyVO> copyWorkflowDefinitions(User loginUser,
+                                                                   long targetProjectCode,
+                                                                   List<WorkflowDefinition> sourceWorkflowDefinitions,
+                                                                   List<String> failedWorkflowList) {
+        List<WorkflowDefinitionCopyVO> copyResponses = new ArrayList<>();
+        for (WorkflowDefinition workflowDefinition : sourceWorkflowDefinitions) {
             List<WorkflowTaskRelation> workflowTaskRelations =
                     workflowTaskRelationDao.queryByWorkflowDefinitionCode(workflowDefinition.getCode());
             List<WorkflowTaskRelationLog> taskRelationList =
                     workflowTaskRelations.stream().map(WorkflowTaskRelationLog::new).collect(Collectors.toList());
             workflowDefinition.setProjectCode(targetProjectCode);
-            if (isCopy) {
-                log.info("Copy workflow definition...");
-                List<TaskDefinitionLog> taskDefinitionLogs =
-                        taskDefinitionLogDao.queryTaskDefineLogList(workflowTaskRelations);
-                Map<Long, Long> taskCodeMap = new HashMap<>();
-                taskDefinitionLogs.forEach(
-                        taskDefinitionLog -> taskCodeMap.put(taskDefinitionLog.getCode(), CodeGenerateUtils.genCode()));
-                for (TaskDefinitionLog taskDefinitionLog : taskDefinitionLogs) {
-                    taskDefinitionLog.setCode(taskCodeMap.get(taskDefinitionLog.getCode()));
-                    taskDefinitionLog.setProjectCode(targetProjectCode);
-                    taskDefinitionLog.setVersion(0);
-                    taskDefinitionLog.setName(taskDefinitionLog.getName());
+            log.info("Copy workflow definition...");
+            List<TaskDefinitionLog> taskDefinitionLogs =
+                    taskDefinitionLogDao.queryTaskDefineLogList(workflowTaskRelations);
+            Map<Long, Long> taskCodeMap = new HashMap<>();
+            taskDefinitionLogs.forEach(
+                    taskDefinitionLog -> taskCodeMap.put(taskDefinitionLog.getCode(), CodeGenerateUtils.genCode()));
+            for (TaskDefinitionLog taskDefinitionLog : taskDefinitionLogs) {
+                taskDefinitionLog.setCode(taskCodeMap.get(taskDefinitionLog.getCode()));
+                taskDefinitionLog.setProjectCode(targetProjectCode);
+                taskDefinitionLog.setVersion(0);
+                taskDefinitionLog.setName(taskDefinitionLog.getName());
 
-                    if (TaskTypeUtils.isSwitchTask(taskDefinitionLog.getTaskType())) {
-                        replaceTaskCodeForSwitchTaskParams(taskDefinitionLog, taskCodeMap);
-                    }
-
-                    if (TaskTypeUtils.isConditionTask(taskDefinitionLog.getTaskType())) {
-                        replaceTaskCodeForConditionTaskParams(taskDefinitionLog, taskCodeMap);
-                    }
+                if (TaskTypeUtils.isSwitchTask(taskDefinitionLog.getTaskType())) {
+                    replaceTaskCodeForSwitchTaskParams(taskDefinitionLog, taskCodeMap);
                 }
 
-                for (WorkflowTaskRelationLog workflowTaskRelationLog : taskRelationList) {
-                    if (workflowTaskRelationLog.getPreTaskCode() > 0) {
-                        workflowTaskRelationLog
-                                .setPreTaskCode(taskCodeMap.get(workflowTaskRelationLog.getPreTaskCode()));
-                    }
-                    if (workflowTaskRelationLog.getPostTaskCode() > 0) {
-                        workflowTaskRelationLog
-                                .setPostTaskCode(taskCodeMap.get(workflowTaskRelationLog.getPostTaskCode()));
-                    }
+                if (TaskTypeUtils.isConditionTask(taskDefinitionLog.getTaskType())) {
+                    replaceTaskCodeForConditionTaskParams(taskDefinitionLog, taskCodeMap);
                 }
-                final long oldWorkflowDefinitionCode = workflowDefinition.getCode();
-                workflowDefinition.setCode(CodeGenerateUtils.genCode());
+            }
 
-                workflowDefinition.setId(null);
-                workflowDefinition.setUserId(loginUser.getId());
-                workflowDefinition.setName(getNewName(workflowDefinition.getName(), COPY_SUFFIX));
-                final Date date = new Date();
-                workflowDefinition.setCreateTime(date);
-                workflowDefinition.setUpdateTime(date);
-                workflowDefinition.setReleaseState(ReleaseState.OFFLINE);
-                if (StringUtils.isNotBlank(workflowDefinition.getLocations())) {
-                    ArrayNode jsonNodes = JSONUtils.parseArray(workflowDefinition.getLocations());
-                    for (int i = 0; i < jsonNodes.size(); i++) {
-                        ObjectNode node = (ObjectNode) jsonNodes.path(i);
-                        node.put("taskCode", taskCodeMap.get(node.get("taskCode").asLong()));
-                        jsonNodes.set(i, node);
-                    }
-                    workflowDefinition.setLocations(JSONUtils.toJsonString(jsonNodes));
+            for (WorkflowTaskRelationLog workflowTaskRelationLog : taskRelationList) {
+                if (workflowTaskRelationLog.getPreTaskCode() > 0) {
+                    workflowTaskRelationLog
+                            .setPreTaskCode(taskCodeMap.get(workflowTaskRelationLog.getPreTaskCode()));
                 }
-                // copy timing configuration
-                Schedule scheduleObj = scheduleDao.queryByWorkflowDefinitionCode(oldWorkflowDefinitionCode);
-                if (scheduleObj != null) {
-                    scheduleObj.setId(null);
-                    scheduleObj.setUserId(loginUser.getId());
-                    scheduleObj.setWorkflowDefinitionCode(workflowDefinition.getCode());
-                    scheduleObj.setReleaseState(ReleaseState.OFFLINE);
-                    scheduleObj.setCreateTime(date);
-                    scheduleObj.setUpdateTime(date);
-                    int insertResult = scheduleDao.insert(scheduleObj);
-                    if (insertResult != 1) {
-                        log.error("Schedule create error, workflowDefinitionCode:{}.", workflowDefinition.getCode());
-                        throw new ServiceException(Status.CREATE_SCHEDULE_ERROR);
-                    }
+                if (workflowTaskRelationLog.getPostTaskCode() > 0) {
+                    workflowTaskRelationLog
+                            .setPostTaskCode(taskCodeMap.get(workflowTaskRelationLog.getPostTaskCode()));
                 }
-                try {
-                    createDagDefine(loginUser, taskRelationList, workflowDefinition, taskDefinitionLogs);
-                } catch (Exception e) {
-                    log.error("Copy workflow definition error, workflowDefinitionCode from {} to {}.",
-                            oldWorkflowDefinitionCode, workflowDefinition.getCode(), e);
-                    failedWorkflowList.add(workflowDefinition.getCode() + "[" + workflowDefinition.getName() + "]");
+            }
+            final long oldWorkflowDefinitionCode = workflowDefinition.getCode();
+            workflowDefinition.setCode(CodeGenerateUtils.genCode());
+
+            workflowDefinition.setId(null);
+            workflowDefinition.setUserId(loginUser.getId());
+            workflowDefinition.setName(getNewName(workflowDefinition.getName(), COPY_SUFFIX));
+            final Date date = new Date();
+            workflowDefinition.setCreateTime(date);
+            workflowDefinition.setUpdateTime(date);
+            workflowDefinition.setReleaseState(ReleaseState.OFFLINE);
+            if (StringUtils.isNotBlank(workflowDefinition.getLocations())) {
+                ArrayNode jsonNodes = JSONUtils.parseArray(workflowDefinition.getLocations());
+                for (int i = 0; i < jsonNodes.size(); i++) {
+                    ObjectNode node = (ObjectNode) jsonNodes.path(i);
+                    node.put("taskCode", taskCodeMap.get(node.get("taskCode").asLong()));
+                    jsonNodes.set(i, node);
                 }
-            } else {
-                log.info("Move workflow definition...");
-                try {
-                    updateDagDefine(loginUser, taskRelationList, workflowDefinition, null,
-                            Lists.newArrayList());
-                } catch (Exception e) {
-                    log.error("Move workflow definition error, workflowDefinitionCode:{}.",
-                            workflowDefinition.getCode(), e);
-                    failedWorkflowList.add(workflowDefinition.getCode() + "[" + workflowDefinition.getName() + "]");
+                workflowDefinition.setLocations(JSONUtils.toJsonString(jsonNodes));
+            }
+            // copy timing configuration
+            Schedule scheduleObj = scheduleDao.queryByWorkflowDefinitionCode(oldWorkflowDefinitionCode);
+            if (scheduleObj != null) {
+                scheduleObj.setId(null);
+                scheduleObj.setUserId(loginUser.getId());
+                scheduleObj.setWorkflowDefinitionCode(workflowDefinition.getCode());
+                scheduleObj.setReleaseState(ReleaseState.OFFLINE);
+                scheduleObj.setCreateTime(date);
+                scheduleObj.setUpdateTime(date);
+                int insertResult = scheduleDao.insert(scheduleObj);
+                if (insertResult != 1) {
+                    log.error("Schedule create error, workflowDefinitionCode:{}.", workflowDefinition.getCode());
+                    throw new ServiceException(Status.CREATE_SCHEDULE_ERROR);
                 }
+            }
+            try {
+                createDagDefine(loginUser, taskRelationList, workflowDefinition, taskDefinitionLogs);
+                copyResponses.add(WorkflowDefinitionCopyVO.builder()
+                        .projectCode(targetProjectCode)
+                        .workflowDefinitionCode(workflowDefinition.getCode())
+                        .build());
+            } catch (Exception e) {
+                log.error("Copy workflow definition error, workflowDefinitionCode from {} to {}.",
+                        oldWorkflowDefinitionCode, workflowDefinition.getCode(), e);
+                failedWorkflowList.add(workflowDefinition.getCode() + "[" + workflowDefinition.getName() + "]");
+            }
+        }
+        return copyResponses;
+    }
+
+    private void moveWorkflowDefinitions(User loginUser,
+                                         long targetProjectCode,
+                                         List<WorkflowDefinition> sourceWorkflowDefinitions,
+                                         List<String> failedWorkflowList) {
+        for (WorkflowDefinition workflowDefinition : sourceWorkflowDefinitions) {
+            List<WorkflowTaskRelation> workflowTaskRelations =
+                    workflowTaskRelationDao.queryByWorkflowDefinitionCode(workflowDefinition.getCode());
+            List<WorkflowTaskRelationLog> taskRelationList =
+                    workflowTaskRelations.stream().map(WorkflowTaskRelationLog::new).collect(Collectors.toList());
+            workflowDefinition.setProjectCode(targetProjectCode);
+            log.info("Move workflow definition...");
+            try {
+                updateDagDefine(loginUser, taskRelationList, workflowDefinition, null, Lists.newArrayList());
+            } catch (Exception e) {
+                log.error("Move workflow definition error, workflowDefinitionCode:{}.", workflowDefinition.getCode(),
+                        e);
+                failedWorkflowList.add(workflowDefinition.getCode() + "[" + workflowDefinition.getName() + "]");
             }
         }
     }
@@ -1563,8 +1673,7 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
     public void switchWorkflowDefinitionVersion(User loginUser, long projectCode, long code,
                                                 int version) {
         Project project = projectDao.queryByCode(projectCode);
-        // check user access for project
-        projectService.checkProjectAndAuthThrowException(loginUser, project, WORKFLOW_SWITCH_TO_THIS_VERSION);
+        projectService.checkHasProjectWritePermissionThrowException(loginUser, project);
 
         WorkflowDefinition workflowDefinition = workflowDefinitionDao.queryByCode(code).orElse(null);
         if (Objects.isNull(workflowDefinition) || projectCode != workflowDefinition.getProjectCode()) {
@@ -1585,6 +1694,24 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
                     Status.SWITCH_WORKFLOW_DEFINITION_VERSION_NOT_EXIST_WORKFLOW_DEFINITION_VERSION_ERROR,
                     workflowDefinition.getCode(), version);
         }
+        List<WorkflowTaskRelation> workflowTaskRelationList = workflowTaskRelationLogMapper
+                .queryByWorkflowCodeAndVersion(workflowDefinitionLog.getCode(), workflowDefinitionLog.getVersion())
+                .stream()
+                .map(WorkflowTaskRelation::new)
+                .collect(Collectors.toList());
+        List<TaskCodeVersionDto> taskDefinitionList = getTaskCodeVersionDtos(workflowTaskRelationList);
+        List<TaskDefinitionLog> taskDefinitionLogList = CollectionUtils.isEmpty(taskDefinitionList)
+                ? Collections.emptyList()
+                : taskDefinitionLogMapper.queryByTaskDefinitions(taskDefinitionList.stream()
+                        .flatMap(taskCodeVersionDto -> {
+                            TaskDefinitionLog taskDefinitionLog = new TaskDefinitionLog();
+                            taskDefinitionLog.setCode(taskCodeVersionDto.getCode());
+                            taskDefinitionLog.setVersion(taskCodeVersionDto.getVersion());
+                            return Stream.of(taskDefinitionLog);
+                        }).collect(Collectors.toList()));
+        taskDatasourcePermissionChecker.checkPermission(loginUser, taskDefinitionLogList);
+        taskSubWorkflowPermissionChecker.checkPermission(loginUser, taskDefinitionLogList);
+
         int switchVersion = processService.switchVersion(workflowDefinition, workflowDefinitionLog);
         if (switchVersion <= 0) {
             log.error(
@@ -1592,19 +1719,8 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
                     projectCode, code, version);
             throw new ServiceException(Status.SWITCH_WORKFLOW_DEFINITION_VERSION_ERROR);
         }
+        schedulerService.offlineSchedulerByWorkflowCode(code);
 
-        List<WorkflowTaskRelation> workflowTaskRelationList = workflowTaskRelationDao
-                .queryWorkflowTaskRelationsByWorkflowDefinitionCode(workflowDefinitionLog.getCode(),
-                        workflowDefinitionLog.getVersion());
-        List<TaskCodeVersionDto> taskDefinitionList = getTaskCodeVersionDtos(workflowTaskRelationList);
-        List<TaskDefinitionLog> taskDefinitionLogList =
-                taskDefinitionLogMapper.queryByTaskDefinitions(taskDefinitionList.stream()
-                        .flatMap(taskCodeVersionDto -> {
-                            TaskDefinitionLog taskDefinitionLog = new TaskDefinitionLog();
-                            taskDefinitionLog.setCode(taskCodeVersionDto.getCode());
-                            taskDefinitionLog.setVersion(taskCodeVersionDto.getVersion());
-                            return Stream.of(taskDefinitionLog);
-                        }).collect(Collectors.toList()));
         saveWorkflowLineage(workflowDefinitionLog.getProjectCode(), workflowDefinitionLog.getCode(),
                 workflowDefinitionLog.getVersion(), taskDefinitionLogList);
 
@@ -1672,9 +1788,10 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
      * @return the pagination workflow definition versions info of the certain workflow definition
      */
     @Override
-    public Result queryWorkflowDefinitionVersions(User loginUser, long projectCode, int pageNo, int pageSize,
-                                                  long code) {
-        Result result = new Result();
+    public Result<PageInfo<WorkflowDefinitionLog>> queryWorkflowDefinitionVersions(User loginUser, long projectCode,
+                                                                                   int pageNo, int pageSize,
+                                                                                   long code) {
+        Result<PageInfo<WorkflowDefinitionLog>> result = new Result<>();
         Project project = projectDao.queryByCode(projectCode);
         // check user access for project
         projectService.checkProjectAndAuthThrowException(loginUser, project, VERSION_LIST);
@@ -1717,7 +1834,7 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
             throw new ServiceException(Status.MAIN_TABLE_USING_VERSION);
         }
         // check whether there exist running workflow instance under the workflow definition
-        List<WorkflowInstance> workflowInstances = workflowInstanceService.queryByWorkflowCodeVersionStatus(
+        List<WorkflowInstanceSummaryDto> workflowInstances = workflowInstanceService.queryByWorkflowCodeVersionStatus(
                 code,
                 version,
                 WorkflowExecutionStatus.NOT_TERMINAL_STATES);
@@ -1737,17 +1854,20 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
     @Transactional
     @Override
     public void onlineWorkflowDefinition(User loginUser, Long projectCode, Long workflowDefinitionCode) {
-        projectService.checkProjectAndAuthThrowException(loginUser, projectCode, WORKFLOW_ONLINE_OFFLINE);
+        projectService.checkHasProjectWritePermissionThrowException(loginUser, projectCode);
 
         WorkflowDefinition workflowDefinition = workflowDefinitionDao.queryByCode(workflowDefinitionCode)
                 .orElseThrow(() -> new ServiceException(Status.WORKFLOW_DEFINITION_NOT_EXIST, workflowDefinitionCode));
+        if (projectCode != workflowDefinition.getProjectCode()) {
+            throw new ServiceException(Status.WORKFLOW_DEFINITION_NOT_EXIST, workflowDefinitionCode);
+        }
 
         if (ReleaseState.ONLINE.equals(workflowDefinition.getReleaseState())) {
             // do nothing if the workflow is already online
             return;
         }
 
-        checkWorkflowDefinitionIsValidated(workflowDefinition.getCode());
+        checkWorkflowDefinitionIsValidated(loginUser, workflowDefinition.getCode());
         checkAllSubWorkflowDefinitionIsOnline(workflowDefinition.getCode());
 
         workflowDefinition.setReleaseState(ReleaseState.ONLINE);
@@ -1757,10 +1877,13 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
     @Transactional
     @Override
     public void offlineWorkflowDefinition(User loginUser, Long projectCode, Long workflowDefinitionCode) {
-        projectService.checkProjectAndAuthThrowException(loginUser, projectCode, WORKFLOW_ONLINE_OFFLINE);
+        projectService.checkHasProjectWritePermissionThrowException(loginUser, projectCode);
 
         WorkflowDefinition workflowDefinition = workflowDefinitionDao.queryByCode(workflowDefinitionCode)
                 .orElseThrow(() -> new ServiceException(Status.WORKFLOW_DEFINITION_NOT_EXIST, workflowDefinitionCode));
+        if (projectCode != workflowDefinition.getProjectCode()) {
+            throw new ServiceException(Status.WORKFLOW_DEFINITION_NOT_EXIST, workflowDefinitionCode);
+        }
 
         if (ReleaseState.OFFLINE.equals(workflowDefinition.getReleaseState())) {
             // do nothing if the workflow is already offline
@@ -1840,13 +1963,17 @@ public class WorkflowDefinitionServiceImpl extends BaseServiceImpl implements Wo
         return localUserDefParams;
     }
 
-    private void checkWorkflowDefinitionIsValidated(Long workflowDefinitionCode) {
+    private void checkWorkflowDefinitionIsValidated(User loginUser, Long workflowDefinitionCode) {
         // todo: build dag check if the dag is validated
         List<WorkflowTaskRelation> workflowTaskRelations =
                 workflowTaskRelationDao.queryByWorkflowDefinitionCode(workflowDefinitionCode);
         if (CollectionUtils.isEmpty(workflowTaskRelations)) {
             throw new ServiceException(Status.WORKFLOW_DAG_IS_EMPTY);
         }
+        List<TaskDefinitionLog> taskDefinitionLogs =
+                taskDefinitionLogDao.queryTaskDefineLogList(workflowTaskRelations);
+        taskDatasourcePermissionChecker.checkPermission(loginUser, taskDefinitionLogs);
+        taskSubWorkflowPermissionChecker.checkPermission(loginUser, taskDefinitionLogs);
         // todo : check Workflow is validate
     }
 

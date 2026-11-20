@@ -6,8 +6,6 @@
 .DS_Store
 .target
 .idea/
-!.idea/icon.png
-!.idea/vcs.xml
 .run/
 target/
 dist/
